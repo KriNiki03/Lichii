@@ -331,6 +331,10 @@ void SysmixOutput::Pump() {
         return;
     }
     ++p.counters.ticks;
+    if (p.counters.ticks <= 3 || p.counters.ticks % 200 == 0) {
+        LOG_INFO(Service_Audio, "sysmix stream {} tick {}: engaged={} blocks={}", p.id,
+                 p.counters.ticks, p.engaged, p.counters.admitted_blocks);
+    }
     u32 read{}, write{}, filled{};
     if (!p.ReadOccupancy(read, write, filled)) {
         p.Fault();
