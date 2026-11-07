@@ -473,6 +473,17 @@ Tegra::Texture::TICEntry GenericEnvironment::ReadTextureInfo(GPUVAddr tic_addr, 
     const GPUVAddr descriptor_addr{tic_addr + index * sizeof(Tegra::Texture::TICEntry)};
     Tegra::Texture::TICEntry entry;
     gpu_memory->ReadBlock(descriptor_addr, &entry, sizeof(entry));
+    // EDEN_NX2_TIC_TRACE=1: every texture header a translation reads, for matching a native
+    // program's image handles to the images a frame dump shows.
+    if (static const bool tic_trace = std::getenv("EDEN_NX2_TIC_TRACE") != nullptr; tic_trace) {
+        LOG_INFO(HW_GPU,
+                 "TIC trace: program={:#x} stage={} handle={:#x} index={} image={:#x} size={}x{}x{} "
+                 "format={} type={} raw={:016x}/{:016x}/{:016x}/{:016x}",
+                 program_base, static_cast<u32>(stage), raw, index, entry.Address(), entry.Width(),
+                 entry.Height(), entry.Depth(), static_cast<u32>(entry.format.Value()),
+                 static_cast<u32>(entry.texture_type.Value()), entry.raw[0], entry.raw[1],
+                 entry.raw[2], entry.raw[3]);
+    }
     if (entry.format.Value() == Tegra::Texture::TextureFormat{} &&
         std::getenv("EDEN_NX2_RENDER_TRACE")) {
         static std::atomic<u32> traces{};
