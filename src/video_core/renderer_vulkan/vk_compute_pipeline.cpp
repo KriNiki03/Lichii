@@ -445,10 +445,7 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     texture_cache.FillImageViews(std::span(views.data(), views.size()), true);
     if (auto& trace{GetUpscalerTrace()}; trace.enabled && kepler_compute.IsNativeMode()) {
         const u64 frame{trace.frame.load(std::memory_order_relaxed)};
-        // EDEN_NX2_UPSCALER_TRACE=2 arms on any native dispatch.
-        static const bool any_dispatch = std::string_view{std::getenv("EDEN_NX2_UPSCALER_TRACE")} == "2";
-        if (!trace.armed && frame >= trace.first_frame &&
-            (info.uses_subgroup_shuffles || any_dispatch)) {
+        if (!trace.armed && frame >= trace.first_frame && info.uses_subgroup_shuffles) {
             trace.armed = true;
             trace.armed_frame = frame;
             LOG_INFO(Render_Vulkan, "Upscaler trace armed at frame {} by {:016x}", frame,
