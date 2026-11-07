@@ -482,6 +482,9 @@ void DmaPusher::CallMethod(u32 argument) {
             } else if (memory_writer) {
                 split.NoteMemoryWriter();
             }
+            if (split.TracksMemoryWrites() && (writer || memory_writer)) {
+                split.NoteUnboundedMemoryWriter();
+            }
         };
         if (split.Active()) {
             const GPUVAddr segment = dma_state.dma_get + dma_state.dma_word_offset;
@@ -505,6 +508,10 @@ void DmaPusher::CallMethod(u32 argument) {
             }
             split.Method(subchannel, dma_state.method, argument, dma_state.is_last_call,
                          WantsSegment() ? &segment : nullptr);
+            if (engine_type == Engines::EngineTypes::Maxwell3D && split.TracksMemoryWrites()) {
+                // Its macros run on the back: any method may write (the front path notes them).
+                split.NoteMemoryWriter();
+            }
             return;
         }
         if (!subchannel->execution_mask[dma_state.method]) {
@@ -544,6 +551,9 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
             } else if (memory_writer) {
                 split.NoteMemoryWriter();
             }
+            if (split.TracksMemoryWrites() && (writer || memory_writer)) {
+                split.NoteUnboundedMemoryWriter();
+            }
         };
         if (split.Active()) {
             const GPUVAddr segment = dma_state.dma_get + dma_state.dma_word_offset;
@@ -567,6 +577,10 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
             }
             split.MultiMethod(subchannel, dma_state.method, base_start, num_methods,
                               dma_state.method_count, WantsSegment() ? &segment : nullptr);
+            if (engine_type == Engines::EngineTypes::Maxwell3D && split.TracksMemoryWrites()) {
+                // Its macros run on the back: any method may write (the front path notes them).
+                split.NoteMemoryWriter();
+            }
             return;
         }
         VideoCommon::Nx2Profile::Scope method_scope{VideoCommon::Nx2Profile::Zone::Method};

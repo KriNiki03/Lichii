@@ -12,6 +12,7 @@
 #endif
 #include <chrono>
 #include <cstdlib>
+#include <mutex>
 #include <string>
 #include <unordered_set>
 
@@ -103,7 +104,7 @@ inline u64 Ticks() {
 struct ThreadData {
     std::array<u64, static_cast<size_t>(Zone::Count)> exclusive_ns{};
     std::array<u64, static_cast<size_t>(Zone::Count)> count{};
-    std::array<u64, 15> counters{}; ///< See Counter
+    std::array<u64, 21> counters{}; ///< See Counter
     std::array<u64, static_cast<size_t>(DrainSite::Count)> drain_ns{};
     std::array<u64, static_cast<size_t>(DrainSite::Count)> drain_count{};
     u64 child_ns{};    ///< Time of the zones nested in the current one
@@ -164,7 +165,15 @@ enum class Counter : u32 {
     SemAsyncPending,  ///< SemaphoreReadableNow false: a counter report or timed release is pending
     SemWritersWait,   ///< SemaphoreReadableNow false: WaitForWritesTo gave up
     AcquireNoDrain,   ///< Acquires of a current word not met yet that registered without a drain
+    DmaReadsFast,   ///< EDEN_NX2_DMA_READ_FAST: MME DMA reads made without draining the split
+    AcquiresFast,   ///< EDEN_NX2_ACQUIRE_PRECHECK: acquires met without draining the split
+    PtrCacheHits,   ///< EDEN_NX2_HANDLE_PTR_CACHE: handle/descriptor reads, page pointer cached
+    PtrCacheMisses, ///< EDEN_NX2_HANDLE_PTR_CACHE: handle/descriptor reads, page looked up
+    UboInPlaceSame, ///< EDEN_NX2_UBO_INPLACE: small uniform buffers unchanged, nothing copied
+    UboInPlaceChanged, ///< EDEN_NX2_UBO_INPLACE: small uniform buffers changed, copied once
+    Count,
 };
+static_assert(static_cast<size_t>(Counter::Count) <= std::tuple_size_v<decltype(ThreadData::counters)>);
 
 /// Method calls on this thread by method (3D registers on the back, macros on the front), and
 /// same-value writes among them; MME DMA reads by the macro that made them. The most frequent
@@ -211,11 +220,22 @@ inline std::string TopMethods(const std::array<u32, 0x2000>& counts,
     return text;
 }
 
-/// Device pages (4 KiB) the native MME has DMA-read since start (GPU thread only; filled only
-/// while profiling): which buffer downloads anything on the GPU thread reads back.
+/// Device pages (4 KiB) the native MME has DMA-read since start (filled only while profiling):
+/// which buffer downloads anything on the GPU thread reads back. With the GPU thread split the
+/// front reads and the back downloads: take DmaReadPagesMutex around every use.
 inline std::unordered_set<u64>& DmaReadPages() {
     static std::unordered_set<u64> pages;
     return pages;
+}
+
+inline std::mutex& DmaReadPagesMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+inline void AddDmaReadPage(u64 page) {
+    std::scoped_lock lock{DmaReadPagesMutex()};
+    DmaReadPages().insert(page);
 }
 
 inline void Add(Counter counter, u64 amount) {
@@ -293,6 +313,28 @@ inline void Report(const char* thread_name = "GPU thread") {
                         static_cast<double>(data.counters[13]) * 1e9 / window);
     line += fmt::format(" | acquires registered without a drain {:.0f}",
                         static_cast<double>(data.counters[14]) * 1e9 / window);
+    if (const u64 fast = data.counters[static_cast<size_t>(Counter::DmaReadsFast)]; fast != 0) {
+        line += fmt::format(" | MME DMA reads without a drain {:.0f}",
+                            static_cast<double>(fast) * 1e9 / window);
+    }
+    if (const u64 fast = data.counters[static_cast<size_t>(Counter::AcquiresFast)]; fast != 0) {
+        line += fmt::format(" | acquires without a drain {:.0f}",
+                            static_cast<double>(fast) * 1e9 / window);
+    }
+    if (const u64 hits = data.counters[static_cast<size_t>(Counter::PtrCacheHits)],
+        misses = data.counters[static_cast<size_t>(Counter::PtrCacheMisses)];
+        hits != 0 || misses != 0) {
+        line += fmt::format(" | handle page pointers {:.0f} cached, {:.0f} looked up",
+                            static_cast<double>(hits) * 1e9 / window,
+                            static_cast<double>(misses) * 1e9 / window);
+    }
+    if (const u64 same = data.counters[static_cast<size_t>(Counter::UboInPlaceSame)],
+        changed = data.counters[static_cast<size_t>(Counter::UboInPlaceChanged)];
+        same != 0 || changed != 0) {
+        line += fmt::format(" | uniform buffers compared in place {:.0f} unchanged, {:.0f} changed",
+                            static_cast<double>(same) * 1e9 / window,
+                            static_cast<double>(changed) * 1e9 / window);
+    }
     std::string drains;
     for (size_t i = 0; i < data.drain_count.size(); ++i) {
         if (data.drain_count[i] != 0) {
