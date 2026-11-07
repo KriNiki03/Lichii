@@ -4,7 +4,6 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <cstdlib>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -101,33 +100,6 @@ static bool IsBlockedHost(const std::string& host) {
     return std::any_of(
         blockedDomains.begin(), blockedDomains.end(),
         [&host](const std::string& domain) { return host.find(domain) != std::string::npos; });
-}
-
-// EDEN_NX2_ONLINE_HOSTS=<names> and EDEN_NX2_ONLINE_SERVER=<ip>:<port>: these names and their
-// subdomains resolve to a local stand-in server (the playDB-CNT launcher's).
-static bool IsOnlineStandInHost(const std::string& host) {
-    static const std::vector<std::string> hosts = [] {
-        std::vector<std::string> names;
-        const char* value = std::getenv("EDEN_NX2_ONLINE_HOSTS");
-        std::string list{value != nullptr ? value : ""};
-        while (!list.empty()) {
-            const size_t comma = list.find(',');
-            names.push_back(list.substr(0, comma));
-            list = comma == std::string::npos ? std::string{} : list.substr(comma + 1);
-        }
-        return names;
-    }();
-    return std::getenv("EDEN_NX2_ONLINE_SERVER") != nullptr &&
-           std::any_of(hosts.begin(), hosts.end(), [&host](const std::string& name) {
-               return host == name || (host.size() > name.size() && host.ends_with(name) &&
-                                       host[host.size() - name.size() - 1] == '.');
-           });
-}
-
-static std::pair<std::string, std::string> OnlineStandInAddress() {
-    const std::string server{std::getenv("EDEN_NX2_ONLINE_SERVER")};
-    const size_t colon = server.rfind(':');
-    return {server.substr(0, colon), server.substr(colon + 1)};
 }
 
 static NetDbError GetAddrInfoErrorToNetDbError(GetAddrInfoError result) {
@@ -231,14 +203,12 @@ static std::pair<u32, GetAddrInfoError> GetHostByNameRequestImpl(HLERequestConte
     // For now, ignore options, which are in input buffer 1 for GetHostByNameRequestWithOptions.
 
     // Prevent resolution of Nintendo servers
-    const bool stand_in = IsOnlineStandInHost(host);
-    if (!stand_in && IsBlockedHost(host)) {
+    if (IsBlockedHost(host)) {
         LOG_WARNING(Network, "Resolution of hostname {} requested, returning EAI_AGAIN", host);
         return {0, GetAddrInfoError::AGAIN};
     }
 
-    auto res_v = Network::GetAddressInfo(stand_in ? OnlineStandInAddress().first : host,
-                                         /*service*/ std::nullopt);
+    auto res_v = Network::GetAddressInfo(host, /*service*/ std::nullopt);
     if (auto* res = std::get_if<std::vector<Network::AddrInfo>>(&res_v)) {
         const std::vector<u8> data = SerializeAddrInfoAsHostEnt(*res, host);
         const u32 data_size = u32(data.size());
@@ -349,8 +319,7 @@ static std::pair<u32, GetAddrInfoError> GetAddrInfoRequestImpl(HLERequestContext
     const std::string host = Common::StringFromBuffer(host_buffer);
 
     // Prevent resolution of Nintendo servers
-    const bool stand_in = IsOnlineStandInHost(host);
-    if (!stand_in && IsBlockedHost(host)) {
+    if (IsBlockedHost(host)) {
         LOG_WARNING(Network, "Resolution of hostname {} requested, returning EAI_AGAIN", host);
         return {0, GetAddrInfoError::AGAIN};
     }
@@ -363,12 +332,7 @@ static std::pair<u32, GetAddrInfoError> GetAddrInfoRequestImpl(HLERequestContext
 
     // Serialized hints are also passed in a buffer, but are ignored for now.
 
-    if (stand_in) {
-        LOG_INFO(Network, "Hostname {} resolves to the local stand-in server", host);
-    }
-    auto res_v = stand_in ? Network::GetAddressInfo(OnlineStandInAddress().first,
-                                                    OnlineStandInAddress().second)
-                          : Network::GetAddressInfo(host, service);
+    auto res_v = Network::GetAddressInfo(host, service);
     if (auto* res = std::get_if<std::vector<Network::AddrInfo>>(&res_v)) {
         const std::vector<u8> data = SerializeAddrInfo(*res, host);
         const u32 data_size = u32(data.size());

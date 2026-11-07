@@ -5,8 +5,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
-#include <cstdlib>
-#include <string_view>
 #include <array>
 
 #include "common/common_types.h"
@@ -508,11 +506,6 @@ protected:
 
         std::vector<u8> token_data(0x100);
         std::fill(token_data.begin(), token_data.end(), u8(0));
-        if (std::getenv("EDEN_NX2_ONLINE_SERVER") != nullptr) {
-            static constexpr std::string_view Token{
-                "eyJhbGciOiJub25lIn0.eyJzdWIiOiIwMDAwMDAwMDAwMDAwMDAxIiwiZXhwIjo0MTAyNDQ0ODAwfQ."};
-            token_data.assign(Token.begin(), Token.end());
-        }
 
         (void)ctx.WriteBuffer(token_data);
 
@@ -746,13 +739,6 @@ private:
 
         std::vector<u8> token_data(0x100);
         std::fill(token_data.begin(), token_data.end(), u8(0));
-        // EDEN_NX2_ONLINE_SERVER: a JWT-shaped token for the local stand-in server, which only
-        // stores it. The online libraries give up on an empty one before they connect.
-        if (std::getenv("EDEN_NX2_ONLINE_SERVER") != nullptr) {
-            static constexpr std::string_view Token{
-                "eyJhbGciOiJub25lIn0.eyJzdWIiOiIwMDAwMDAwMDAwMDAwMDAxIiwiZXhwIjo0MTAyNDQ0ODAwfQ."};
-            token_data.assign(Token.begin(), Token.end());
-        }
 
         ctx.WriteBuffer(token_data);
 
