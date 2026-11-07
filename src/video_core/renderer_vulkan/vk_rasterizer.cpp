@@ -1270,33 +1270,39 @@ void RasterizerVulkan::Clear(u32 layer_count) {
                      regs.clear_control.use_clear_rect.Value(), regs.clear_color[0]);
         }
     }
-    if (clear_layers.count == 0) {
-        return;
-    }
-    // EDEN_NX2_CLEAR_ALL_SLICES=1, a test: clear a volume target's image outside any render pass.
-    static const bool clear_all_slices = std::getenv("EDEN_NX2_CLEAR_ALL_SLICES") != nullptr;
-    if (clear_all_slices && regs.clear_surface.RT == 0 && framebuffer->Layers() > 1 &&
-        regs.rt[0].width < 256 && texture_cache.GetRenderTargets().color_buffer_ids[0]) {
-        const auto& view =
-            texture_cache.GetImageView(texture_cache.GetRenderTargets().color_buffer_ids[0]);
-        static std::atomic<u32> logged{};
-        if (const auto* const image = view.BackingImage();
-            image && logged.fetch_add(1, std::memory_order_relaxed) < 12) {
-            LOG_INFO(Render_Vulkan, "Clear slices: rt0={:#x} image={:#x} type={} depth={} layers={}",
-                     regs.rt[0].Address(), image->gpu_addr, static_cast<u32>(image->info.type),
-                     image->info.size.depth, image->info.resources.layers);
-        }
-        if (base_array_layer != 0) {
+    // Slices of a 3D color target past the framebuffer's layers: a 1-layer depth target bound with
+    // it limits the framebuffer to one layer, and a clear can't reach the other slices. Volumes
+    // are cleared slice by slice, so the first slice's zero clear takes the whole image.
+    const auto color_target_id = texture_cache.GetRenderTargets().color_buffer_ids[regs.clear_surface.RT];
+    if (color_target_id && regs.rt[regs.clear_surface.RT].depth > framebuffer->Layers()) {
+        const auto& color_target = texture_cache.GetImageView(color_target_id);
+        const bool volume = True(color_target.flags & VideoCommon::ImageViewFlagBits::Slice);
+        const bool zero_colour = std::ranges::all_of(regs.clear_color,
+                                                     [](f32 value) { return value == 0.0f; });
+        if (volume && zero_colour && regs.clear_surface.R && regs.clear_surface.G &&
+            regs.clear_surface.B && regs.clear_surface.A) {
+            if (base_array_layer != 0) {
+                return;
+            }
+            const VkImage volume_image = color_target.ImageHandle();
+            scheduler.RequestOutsideRenderPassOperationContext();
+            scheduler.Record([volume_image](vk::CommandBuffer cmdbuf) {
+                const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                const VkClearColorValue zero{};
+                cmdbuf.ClearColorImage(volume_image, VK_IMAGE_LAYOUT_GENERAL, zero, range);
+                const VkMemoryBarrier barrier{
+                    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                    .pNext = nullptr,
+                    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                    .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                };
+                cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                       VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, barrier);
+            });
             return;
         }
-        const VkImage image_handle = view.ImageHandle();
-        scheduler.RequestOutsideRenderPassOperationContext();
-        scheduler.Record([image_handle](vk::CommandBuffer cmdbuf) {
-            const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0,
-                                                VK_REMAINING_ARRAY_LAYERS};
-            const VkClearColorValue zero{};
-            cmdbuf.ClearColorImage(image_handle, VK_IMAGE_LAYOUT_GENERAL, zero, range);
-        });
+    }
+    if (clear_layers.count == 0) {
         return;
     }
 
