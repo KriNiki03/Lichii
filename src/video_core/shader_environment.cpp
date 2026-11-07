@@ -748,6 +748,11 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(u32
     // unreachable data. Existing disk-cache serialization carries it with code.
     lowered_code.push_back(0);
     Shader::Ampere::AppendNativeAddressMap(lowered_code, lowered.source_instruction_offsets);
+    // Shader dump files are named by the program key, the frame dump by the shader hash.
+    if (std::getenv("EDEN_NX2_SHADER_DUMP")) {
+        LOG_INFO(HW_GPU, "Native program {:#x}: key {:016x}, shader hash {:016x}", program_base,
+                 result->native_program_key, NativeShaderHash(lowered_code));
+    }
     // EDEN_NX2_REJECT_HASH=<hash>,...: like EDEN_NX2_REJECT, but by native program key (shader
     // dump file names) or shader hash (frame dump "shaders"), which stay the same between runs.
     if (static const std::string reject_hashes = [] {
