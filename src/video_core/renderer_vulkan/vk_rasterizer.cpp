@@ -1237,6 +1237,20 @@ void RasterizerVulkan::Clear(u32 layer_count) {
                   "Framebuffer clear layers: base={}, requested={}, clipped={}, framebuffer={}",
                   base_array_layer, layer_count, clear_layers.count, framebuffer->Layers());
     }
+    // EDEN_NX2_CLEAR_TRACE=1: clears of layered targets narrower than 256 (volume textures).
+    static const bool clear_trace = std::getenv("EDEN_NX2_CLEAR_TRACE") != nullptr;
+    if (clear_trace && framebuffer->Layers() > 1 && regs.rt[0].width < 256) {
+        static std::atomic<u32> clear_traces{};
+        if (clear_traces.fetch_add(1, std::memory_order_relaxed) < 3000) {
+            LOG_INFO(Render_Vulkan,
+                     "Clear trace: rt0={:#x} {}x{} raw={:#x} base={} count={} clipped={} "
+                     "fb_layers={} rt_depth={} clear_rect={} colour={}",
+                     regs.rt[0].Address(), regs.rt[0].width, regs.rt[0].height,
+                     regs.clear_surface.raw, base_array_layer, layer_count, clear_layers.count,
+                     framebuffer->Layers(), regs.rt[0].depth,
+                     regs.clear_control.use_clear_rect.Value(), regs.clear_color[0]);
+        }
+    }
     if (clear_layers.count == 0) {
         return;
     }
