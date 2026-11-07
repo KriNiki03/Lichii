@@ -988,13 +988,15 @@ void RasterizerVulkan::TraceVertexInputs() {
     }
     for (size_t stream = 0; stream < 4; ++stream) {
         const auto& vertex = regs.vertex_streams[stream];
-        std::array<u32, 16> words{};
+        std::array<u32, 48> words{};
         if (vertex.IsEnabled()) {
             gpu_memory->ReadBlockUnsafe(vertex.Address(), words.data(), sizeof(words));
         }
-        LOG_INFO(Render_Vulkan, "Vertex trace stream {}: enabled={} address={:#x} stride={} words {:08x}",
-                 stream, vertex.IsEnabled(), vertex.Address(), vertex.stride.Value(),
-                 fmt::join(words, " "));
+        LOG_INFO(Render_Vulkan,
+                 "Vertex trace stream {}: enabled={} instanced={} frequency={} address={:#x} "
+                 "stride={} words {:08x}",
+                 stream, vertex.IsEnabled(), regs.vertex_stream_instances.IsInstancingEnabled(stream),
+                 vertex.frequency, vertex.Address(), vertex.stride.Value(), fmt::join(words, " "));
     }
 }
 
@@ -3315,7 +3317,10 @@ void RasterizerVulkan::UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs) 
 
     for (u32 binding = 0; binding < max_bindings; ++binding) {
         const auto& input_binding{regs.vertex_streams[binding]};
-        const bool is_instanced{regs.vertex_stream_instances.IsInstancingEnabled(binding)};
+        // EDEN_NX2_VERTEX_RATE_FIX: a draw of one instance steps every binding per vertex.
+        static const bool rate_fix = std::getenv("EDEN_NX2_VERTEX_RATE_FIX") != nullptr;
+        const bool is_instanced{regs.vertex_stream_instances.IsInstancingEnabled(binding) &&
+                                !(rate_fix && maxwell3d->draw_manager.draw_state.instance_count <= 1)};
         bindings.push_back({
             .sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT,
             .pNext = nullptr,
