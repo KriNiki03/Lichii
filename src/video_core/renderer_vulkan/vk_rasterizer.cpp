@@ -1282,6 +1282,12 @@ void RasterizerVulkan::Clear(u32 layer_count) {
         .baseArrayLayer = base_array_layer,
         .layerCount = clear_layers.count,
     };
+    // EDEN_NX2_CLEAR_ALL_SLICES=1, a test: the first clear of a 3D target clears every slice.
+    static const bool clear_all_slices = std::getenv("EDEN_NX2_CLEAR_ALL_SLICES") != nullptr;
+    if (clear_all_slices && regs.clear_surface.RT == 0 && base_array_layer == 0 &&
+        framebuffer->Layers() > 1 && regs.rt[0].width < 256) {
+        clear_rect.layerCount = framebuffer->Layers();
+    }
     const auto clamp_rect_to_render_area = [render_area](VkRect2D& rect) -> bool {
         const auto clamp_axis = [](s32& offset, u32& extent, u32 limit) {
             auto clamp_offset = [&offset, limit]() {
