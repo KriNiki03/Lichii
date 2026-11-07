@@ -17,6 +17,7 @@ LsfgShaders::LsfgShaders(const Device& device) {
                     device.IsHostFloat16Supported());
         return;
     }
+    device_supported = true;
 
     VideoCore::FrameGen::ShaderModules code;
     const auto status = VideoCore::FrameGen::LoadShaderModules(code);
