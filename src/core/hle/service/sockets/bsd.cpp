@@ -1771,8 +1771,19 @@ Errno BSD_USA::ConnectImpl(s32 fd, std::span<const u8> addr) {
     ASSERT(addr.size() >= 16);
 
     auto addr_in = GetValue<SockAddrIn>(addr);
+    auto target = Translate(addr_in);
+    // EDEN_NX2_ONLINE_SERVER: HTTPS to the stand-in server's address goes to its port.
+    static const u16 online_port = [] {
+        const char* server = std::getenv("EDEN_NX2_ONLINE_SERVER");
+        const char* colon = server != nullptr ? std::strrchr(server, ':') : nullptr;
+        return colon != nullptr ? static_cast<u16>(std::atoi(colon + 1)) : u16{0};
+    }();
+    if (online_port != 0 && target.portno == 443) {
+        LOG_INFO(Service, "Connecting to the stand-in server on port {}", online_port);
+        target.portno = online_port;
+    }
 
-    const Errno result = Translate(descriptor->socket->Connect(Translate(addr_in)));
+    const Errno result = Translate(descriptor->socket->Connect(target));
 
     if (result == Errno::ISCONN) {
         LOG_DEBUG(Service, "returned ISCONN - socket already connected");
