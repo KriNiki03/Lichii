@@ -667,6 +667,7 @@ void TraceWindowTarget(const Tegra::Engines::Maxwell3D& maxwell3d, Tegra::Memory
 } // Anonymous namespace
 
 void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
+    TraceVertexInputs();
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
     {
         // A draw's first and count can come from memory a skipped (rejected) compute program
@@ -949,6 +950,52 @@ void RasterizerVulkan::DrawIndirect() {
         }
     }, true);
     buffer_cache.SetDrawIndirect(nullptr);
+}
+
+// EDEN_NX2_VERTEX_TRACE=<gpu address>[,...]: vertex attributes and the first bytes of each stream
+// for draws into these colour targets, every 300th such draw.
+void RasterizerVulkan::TraceVertexInputs() {
+    static const std::vector<u64> targets = [] {
+        std::vector<u64> list;
+        const char* value = std::getenv("EDEN_NX2_VERTEX_TRACE");
+        while (value != nullptr && *value != '\0') {
+            char* end = nullptr;
+            list.push_back(std::strtoull(value, &end, 16));
+            value = *end == ',' ? end + 1 : nullptr;
+        }
+        return list;
+    }();
+    if (targets.empty()) {
+        return;
+    }
+    const auto& regs = maxwell3d->regs;
+    if (std::find(targets.begin(), targets.end(), regs.rt[0].Address()) == targets.end()) {
+        return;
+    }
+    static u64 seen{};
+    if (seen++ % 300 > 1) {
+        return;
+    }
+    const auto& draw = maxwell3d->draw_manager.draw_state;
+    LOG_INFO(Render_Vulkan, "Vertex trace rt={:#x} topology={} first={} count={} instances={}",
+             regs.rt[0].Address(), static_cast<u32>(draw.topology), draw.vertex_buffer.first,
+             draw.vertex_buffer.count, draw.instance_count);
+    for (size_t index = 0; index < 4; ++index) {
+        const auto attribute = regs.vertex_attrib_format[index];
+        LOG_INFO(Render_Vulkan, "Vertex trace attr {}: raw={:#x} buffer={} constant={} offset={}",
+                 index, attribute.hex, attribute.buffer.Value(), attribute.constant.Value(),
+                 attribute.offset.Value());
+    }
+    for (size_t stream = 0; stream < 4; ++stream) {
+        const auto& vertex = regs.vertex_streams[stream];
+        std::array<u32, 16> words{};
+        if (vertex.IsEnabled()) {
+            gpu_memory->ReadBlockUnsafe(vertex.Address(), words.data(), sizeof(words));
+        }
+        LOG_INFO(Render_Vulkan, "Vertex trace stream {}: enabled={} address={:#x} stride={} words {:08x}",
+                 stream, vertex.IsEnabled(), vertex.Address(), vertex.stride.Value(),
+                 fmt::join(words, " "));
+    }
 }
 
 void RasterizerVulkan::TraceDrawFailure(std::string_view reason) {
