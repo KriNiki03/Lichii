@@ -1239,9 +1239,28 @@ void RasterizerVulkan::Clear(u32 layer_count) {
     }
     // EDEN_NX2_CLEAR_TRACE=1: clears of layered targets narrower than 256 (volume textures).
     static const bool clear_trace = std::getenv("EDEN_NX2_CLEAR_TRACE") != nullptr;
-    if (clear_trace && framebuffer->Layers() > 1 && regs.rt[0].width < 256) {
+    if (clear_trace && regs.rt[0].width < 256 && regs.rt[0].width > 16) {
         static std::atomic<u32> clear_traces{};
         if (clear_traces.fetch_add(1, std::memory_order_relaxed) < 3000) {
+            const auto id0 = texture_cache.GetRenderTargets().color_buffer_ids[0];
+            if (id0) {
+                const auto& v0 = texture_cache.GetImageView(id0);
+                const auto* const im = v0.BackingImage();
+                LOG_INFO(Render_Vulkan,
+                         "Clear target: view type={} base={} layers={} depth={} slice={} image={} "
+                         "type={} addr={:#x} {}x{}x{} layers={} rt_count={} tile_dim={}",
+                         static_cast<u32>(v0.type), v0.range.base.layer, v0.range.extent.layers,
+                         v0.size.depth,
+                         True(v0.flags & VideoCommon::ImageViewFlagBits::Slice), im != nullptr,
+                         im ? static_cast<u32>(im->info.type) : 99U, im ? im->gpu_addr : 0,
+                         im ? im->info.size.width : 0, im ? im->info.size.height : 0,
+                         im ? im->info.size.depth : 0, im ? im->info.resources.layers : 0,
+                         regs.rt_control.count.Value(),
+                         static_cast<u32>(regs.rt[0].tile_mode.dim_control.Value()));
+            } else {
+                LOG_INFO(Render_Vulkan, "Clear target: no view, rt_count={}",
+                         regs.rt_control.count.Value());
+            }
             LOG_INFO(Render_Vulkan,
                      "Clear trace: rt0={:#x} {}x{} raw={:#x} base={} count={} clipped={} "
                      "fb_layers={} rt_depth={} clear_rect={} colour={}",
