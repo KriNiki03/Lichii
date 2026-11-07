@@ -1076,8 +1076,9 @@ bool KeplerCompute::ScaleDlssRenderRegion(GPUVAddr constants,
     config.src_x1 = static_cast<s32>(width);
     config.src_y1 = static_cast<s32>(height);
     const bool done = rasterizer->AccelerateSurfaceCopy(surface(*input), surface(*output), config);
-    static u32 logged{};
-    if (logged++ < 8) {
+    static u32 last_width{};
+    if (width != last_width) {
+        last_width = width;
         LOG_INFO(HW_GPU, "DLSS replacement: {} region {}x{} of {}x{} to {}x{}",
                  done ? "scaled" : "could not scale", width, height, input->Width(),
                  input->Height(), output->Width(), output->Height());
