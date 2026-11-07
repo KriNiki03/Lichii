@@ -3414,11 +3414,33 @@ ImageViewId TextureCache<P>::FindRenderTargetView(const ImageInfo& info, GPUVAdd
                   info.size.height, info.resources.layers, gpu_addr);
         return ImageViewId{};
     }
+    // A layered render target over a 3D texture is that texture, its layers being the slices. As
+    // a separate 2D array it would share only its first layer with the texture.
+    ImageInfo target_info = info;
+    if (target_info.type == ImageType::e2D && target_info.resources.layers > 1) {
+        ForEachImageInRegionGPU(channel_state->gpu_memory.GetID(), gpu_addr,
+                                CalculateGuestSizeInBytes(target_info),
+                                [&](ImageId, Image& candidate) {
+            if (candidate.info.type == ImageType::e3D && candidate.gpu_addr == gpu_addr &&
+                candidate.info.size.width == target_info.size.width &&
+                candidate.info.size.height == target_info.size.height &&
+                candidate.info.size.depth == static_cast<u32>(target_info.resources.layers) &&
+                VideoCore::Surface::BytesPerBlock(candidate.info.format) ==
+                    VideoCore::Surface::BytesPerBlock(target_info.format)) {
+                target_info.type = ImageType::e3D;
+                target_info.size.depth = candidate.info.size.depth;
+                target_info.block = candidate.info.block;
+                target_info.resources.layers = 1;
+                return true;
+            }
+            return false;
+        });
+    }
     ImageId image_id{};
     bool delete_state = has_deleted_images;
     do {
         has_deleted_images = false;
-        image_id = FindOrInsertImage(info, gpu_addr);
+        image_id = FindOrInsertImage(target_info, gpu_addr);
         delete_state |= has_deleted_images;
     } while (has_deleted_images);
     has_deleted_images = delete_state;
@@ -3426,14 +3448,15 @@ ImageViewId TextureCache<P>::FindRenderTargetView(const ImageInfo& info, GPUVAdd
         return NULL_IMAGE_VIEW_ID;
     }
     Image& image = slot_images[image_id];
-    const ImageViewType view_type = RenderTargetImageViewType(info);
+    const ImageViewType view_type = RenderTargetImageViewType(target_info);
     SubresourceBase base;
     if (image.info.type == ImageType::Linear) {
         base = SubresourceBase{.level = 0, .layer = 0};
     } else {
         base = image.TryFindBase(gpu_addr).value();
     }
-    const s32 layers = image.info.type == ImageType::e3D ? info.size.depth : info.resources.layers;
+    const s32 layers = image.info.type == ImageType::e3D ? target_info.size.depth
+                                                         : target_info.resources.layers;
     if (RenderTrace::SampleFrame(frame_tick)) {
         LOG_DEBUG(HW_GPU,
                   "Render trace target match: docked={} requested={:#x} {}x{} layers={} format={} "
