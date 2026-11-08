@@ -8,6 +8,19 @@
 
 namespace DC = VideoCommon::DlssContract;
 
+TEST_CASE("Duskbloods temporal geometry uses active rectangles within the backing images",
+          "[dlss_contract]") {
+    const DC::TemporalRegions regions{{888, 500}, {1536, 864}};
+    REQUIRE(DC::ValidRegions(regions, {1920, 1080}, {1920, 1080}));
+    REQUIRE_FALSE(DC::ValidRegions(regions, {887, 500}, {1920, 1080}));
+    REQUIRE_FALSE(DC::ValidRegions(regions, {1920, 1080}, {1536, 863}));
+    REQUIRE_FALSE(DC::ValidRegions({{888, 500}, {800, 600}}, {1920, 1080}, {1920, 1080}));
+    using VideoCore::Surface::PixelFormat;
+    REQUIRE(DC::ValidDepthFormat(PixelFormat::D24_UNORM_S8_UINT, true));
+    REQUIRE_FALSE(DC::ValidDepthFormat(PixelFormat::D24_UNORM_S8_UINT, false));
+    REQUIRE_FALSE(DC::ValidDepthFormat(PixelFormat::R32_FLOAT, true));
+}
+
 TEST_CASE("Spatial cutscene replacement decodes sRGB into float without temporal history",
           "[dlss_contract]") {
     using VideoCore::Surface::PixelFormat;

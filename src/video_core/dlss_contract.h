@@ -38,6 +38,26 @@ constexpr bool FitsExtent(std::array<std::uint32_t, 2> requested,
     return requested[0] <= available[0] && requested[1] <= available[1];
 }
 
+struct TemporalRegions {
+    std::array<std::uint32_t, 2> render;
+    std::array<std::uint32_t, 2> output;
+    bool reset{};
+};
+
+constexpr bool ValidRegions(const TemporalRegions& regions,
+                            std::array<std::uint32_t, 2> input_backing,
+                            std::array<std::uint32_t, 2> output_backing) {
+    return regions.render[0] >= 2 && regions.render[1] >= 2 &&
+           FitsExtent(regions.render, input_backing) && FitsExtent(regions.render, regions.output) &&
+           FitsExtent(regions.output, output_backing);
+}
+
+constexpr bool ValidDepthFormat(VideoCore::Surface::PixelFormat format, bool subrect) {
+    using VideoCore::Surface::PixelFormat;
+    return format == PixelFormat::D32_FLOAT ||
+           (subrect && format == PixelFormat::D24_UNORM_S8_UINT);
+}
+
 inline bool ValidGeometry(std::array<std::uint32_t, 2> render,
                           std::array<std::uint32_t, 2> output,
                           std::array<float, 2> jitter, std::array<float, 2> motion_scale) {

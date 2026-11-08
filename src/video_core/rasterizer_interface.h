@@ -12,6 +12,7 @@
 #include <span>
 #include <utility>
 #include "common/common_types.h"
+#include "video_core/dlss_contract.h"
 #include "common/polyfill_thread.h"
 #include "common/settings.h"
 #include "video_core/cache_types.h"
@@ -216,13 +217,15 @@ public:
     /// Stand-in for a DLSS evaluation: temporal upscale of src into dst along motion_vectors
     /// (jitter in src pixels; motion_scale turns a motion vector into a UV offset to the previous
     /// frame), with depth for NVIDIA DLSS or FSR 3.1. With use_history=false, only de-jitter src.
-    /// False when unsupported; the caller retains its native dispatch.
+    /// False when unsupported; the caller retains its native dispatch. A supporting backend can
+    /// fill the optional failure reason with a static diagnostic string.
     [[nodiscard]] virtual bool AccelerateTemporalUpscale(
         const Tegra::Engines::Fermi2D::Surface& src, const Tegra::Engines::Fermi2D::Surface& dst,
         const Tegra::Engines::Fermi2D::Surface& motion_vectors,
         const Tegra::Texture::TICEntry* depth, std::array<f32, 2> jitter,
         std::array<f32, 2> motion_scale, bool use_history = true,
-        std::optional<std::array<u32, 2>> render_region = std::nullopt) {
+        std::optional<VideoCommon::DlssContract::TemporalRegions> regions = std::nullopt,
+        const char** failure = nullptr) {
         return false;
     }
 

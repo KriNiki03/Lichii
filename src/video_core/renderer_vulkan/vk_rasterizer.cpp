@@ -2293,10 +2293,25 @@ bool RasterizerVulkan::AccelerateTemporalUpscale(
     const Tegra::Engines::Fermi2D::Surface& src, const Tegra::Engines::Fermi2D::Surface& dst,
     const Tegra::Engines::Fermi2D::Surface& motion_vectors, const Tegra::Texture::TICEntry* depth,
     std::array<f32, 2> jitter, std::array<f32, 2> motion_scale, bool use_history,
-    std::optional<std::array<u32, 2>> render_region) {
+    std::optional<VideoCommon::DlssContract::TemporalRegions> regions, const char** failure) {
     std::scoped_lock lock{texture_cache.mutex};
-    return texture_cache.TemporalUpscale(dst, src, motion_vectors, depth, jitter, motion_scale,
-                                          use_history, render_region);
+    try {
+        return texture_cache.TemporalUpscale(dst, src, motion_vectors, depth, jitter, motion_scale,
+                                             use_history, regions, failure);
+    } catch (const vk::Exception& error) {
+        if (!regions || error.GetResult() == VK_ERROR_DEVICE_LOST) {
+            throw;
+        }
+        if (failure) {
+            *failure = "Vulkan temporal resource setup failed";
+        }
+        static std::atomic<u32> reports{};
+        if (reports.load(std::memory_order_relaxed) < 4 &&
+            reports.fetch_add(1, std::memory_order_relaxed) < 4) {
+            LOG_ERROR(Render_Vulkan, "Duskbloods temporal resource setup failed: {}", error.what());
+        }
+        return false;
+    }
 }
 
 Tegra::Engines::AccelerateDMAInterface& RasterizerVulkan::AccessAccelerateDMA() {

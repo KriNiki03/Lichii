@@ -139,7 +139,9 @@ public:
     bool TemporalUpscale(Framebuffer* dst_framebuffer, ImageView& dst, ImageView& input_color,
                          ImageView& motion_vectors, ImageView* depth,
                          std::array<u32, 2> render_size, std::array<f32, 2> jitter,
-                         std::array<f32, 2> motion_scale, bool use_history);
+                         std::array<f32, 2> motion_scale, bool use_history,
+                         std::optional<VideoCommon::DlssContract::TemporalRegions> regions,
+                         const char** failure);
 
     /// True when TemporalUpscale would use the depth (FSR 3.1 not forced off and not failed).
     [[nodiscard]] bool WantsTemporalUpscaleDepth() const;
@@ -248,7 +250,9 @@ public:
     bool UpscaleWithFsr3(Framebuffer* dst_framebuffer, ImageView& input_color,
                          ImageView& motion_vectors, ImageView& depth,
                          std::array<u32, 2> render_size, std::array<f32, 2> jitter,
-                         std::array<f32, 2> motion_scale);
+                         std::array<f32, 2> motion_scale,
+                         std::optional<VideoCommon::DlssContract::TemporalRegions> regions,
+                         const char** failure);
     std::unique_ptr<Fsr3Upscaler> fsr3_upscaler;
     bool fsr3_unsupported{};
     /// The game DLSS network's health check (ProbeGameDlssOutput), created on first use.
@@ -257,7 +261,7 @@ public:
 
     /// Draws an upscaler's RGBA16F output into the DLSS output and returns it to GENERAL.
     void DrawUpscaledOutput(Framebuffer* dst_framebuffer, VkImageView view, VkImage image,
-                            VkSampler sampler);
+                            VkSampler sampler, VkExtent2D extent);
 #ifdef EGLANTINE_STREAMLINE
     /// NVIDIA's DLSS (through NVIDIA Streamline) in place of the game's,
     /// before FSR 3.1, when the setting is on. Returns false to fall back to FSR 3.1.

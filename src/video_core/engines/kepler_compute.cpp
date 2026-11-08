@@ -15,6 +15,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include "common/assert.h"
 #include "common/dkb_frame_trace.h"
 #include "common/logging.h"
@@ -27,6 +28,7 @@
 #include "video_core/nx2.h"
 #include "video_core/engines/fermi_2d.h"
 #include "video_core/engines/kepler_compute.h"
+#include "video_core/dlss_contract.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/game_dlss_status.h"
 #include "video_core/memory_manager.h"
@@ -36,8 +38,26 @@
 #endif
 #include "video_core/rasterizer_interface.h"
 #include "video_core/textures/decoders.h"
+#include "video_core/texture_cache/format_lookup_table.h"
 
 namespace Tegra::Engines {
+
+namespace {
+constexpr u32 DUSK_DLSS_LOG_LIMIT = 4;
+
+template <typename... Args>
+void TraceDuskDlss(bool enabled, fmt::format_string<Args...> format, Args&&... args) {
+    if (enabled) {
+        LOG_INFO(HW_GPU, "Duskbloods DLSS: {}", fmt::format(format, std::forward<Args>(args)...));
+    }
+}
+
+bool IsDuskTemporalImage(const Texture::TICEntry& tic) {
+    return VideoCommon::FireEmblemUpscale::PlainImage(tic) &&
+           tic.msaa_mode == Texture::MsaaMode::Msaa1x1 && !tic.is_sparse &&
+           tic.res_min_mip_level == 0;
+}
+} // Anonymous namespace
 
 KeplerCompute::KeplerCompute(MemoryManager& memory_manager_)
     : memory_manager{memory_manager_}
@@ -581,11 +601,18 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
     if (!launch_description.block_dim_x || !launch_description.block_dim_y || !launch_description.block_dim_z)
         return false;
     dlss_chain.output_pass = false;
+    dusk_dlss_trace_output = false;
     // Fortune's Weave's evaluation is 13 dispatches. Bound incomplete evaluations, including
     // skipped dispatches, so a missing output pass cannot keep the chain active indefinitely.
     constexpr u32 max_dispatches = 64;
     if (dlss_chain.active && ++dlss_chain.dispatches > max_dispatches) {
+        if (dlss_chain.render_region && dusk_dlss_seen && !dusk_dlss_expiry_logged) {
+            dusk_dlss_expiry_logged = true;
+            TraceDuskDlss(true, "chain expired after {} dispatches without an output pass",
+                          max_dispatches);
+        }
         dlss_chain.active = false;
+        dusk_dlss_reset = true;
         dlss_chain.pending.clear();
         dlss_motion_vectors.reset();
         dlss_depth.reset();
@@ -597,6 +624,11 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
     } catch (const VideoCommon::FireEmblemUpscale::DispatchReplaced&) {
         return true;
     } catch (const Shader::Exception& error) {
+        if (dlss_chain.active && dlss_chain.render_region && dusk_dlss_seen &&
+            dusk_dlss_rejection_logs < DUSK_DLSS_LOG_LIMIT) {
+            ++dusk_dlss_rejection_logs;
+            TraceDuskDlss(true, "native shader rejected: {}", error.what());
+        }
         if (Common::DkbFrameTrace::Enabled()) {
             static thread_local Common::DkbFrameTrace::RateLimit limit;
             static thread_local u64 rejected{};
@@ -609,9 +641,11 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
                 rejected = 0;
             }
         }
-        dlss_motion_vectors.reset();
-        dlss_depth.reset();
-        (void)fe_upscale_jitter.Take();
+        if (!dlss_chain.active || !dlss_chain.render_region) {
+            dlss_motion_vectors.reset();
+            dlss_depth.reset();
+            (void)fe_upscale_jitter.Take();
+        }
         static std::unordered_set<std::string> logged;
         if (logged.insert(error.what()).second) {
             LOG_ERROR(HW_GPU, "Native compute shader rejected: {}", error.what());
@@ -626,7 +660,7 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
         }
     }
     if (dlss_chain.output_pass) {
-        return FinishDlssEvaluation() || dispatched;
+        return FinishDlssEvaluation(dispatched) || dispatched;
     }
     return dispatched;
 }
@@ -649,24 +683,51 @@ bool KeplerCompute::ProcessGameDlss(u64 program_id, u64 native_key) {
     if (!passes) {
         return false;
     }
+    bool trace_prepass = false;
+    if (program_id == DuskbloodsProgramId) {
+        if (!dusk_dlss_seen) {
+            dusk_dlss_seen = true;
+            TraceDuskDlss(true, "compute hook active; first key={:016x}, expected prepass={:016x}, "
+                                "output={:016x}", native_key, passes->prepass, passes->output);
+        }
+        if (native_key == passes->prepass && dusk_dlss_prepass_logs < DUSK_DLSS_LOG_LIMIT) {
+            ++dusk_dlss_prepass_logs;
+            trace_prepass = true;
+            TraceDuskDlss(true, "prepass recognized (key={:016x})", native_key);
+        }
+        if (native_key == passes->output && dusk_dlss_output_logs < DUSK_DLSS_LOG_LIMIT) {
+            ++dusk_dlss_output_logs;
+            dusk_dlss_trace_output = true;
+            TraceDuskDlss(true, "output recognized (key={:016x}); chain active={}", native_key,
+                          dlss_chain.active);
+        }
+    }
     if (passes->spatial_only && (native_key == passes->prepass || native_key == passes->output)) {
         TraceDlssContract(native_key, false);
     }
     if (native_key == passes->prepass) {
+        if (passes->render_region && dlss_chain.active) {
+            dusk_dlss_reset = true;
+        }
         dlss_chain.spatial_only = passes->spatial_only;
         dlss_chain.render_region = passes->render_region;
-        CaptureFireEmblemJitter();
+        CaptureFireEmblemJitter(trace_prepass);
         dlss_chain.active = true;
         dlss_chain.rejected = 0;
         dlss_chain.dispatches = 0;
         dlss_chain.pending.clear();
     }
     if (!dlss_chain.active) {
+        if (passes->render_region && native_key == passes->output) {
+            dusk_dlss_reset = true;
+            ReportDuskTemporalResult("output has no current prepass");
+        }
+        TraceDuskDlss(dusk_dlss_trace_output, "replacement skipped: no active prepass chain");
         return false;
     }
     dlss_chain.pending.insert(native_key);
     dlss_chain.output_pass = native_key == passes->output;
-    if (dlss_chain.spatial_only) {
+    if (dlss_chain.spatial_only || dlss_chain.render_region) {
         return false;
     }
     const bool replacement = dlss_chain.failure != VideoCore::GameDlssReason::None ||
@@ -833,9 +894,29 @@ void KeplerCompute::UpdateGameDlssStatus(bool complete, VideoCore::GameDlssReaso
 
 // Ends this frame's DLSS evaluation at its output pass: either the network's own result stays,
 // or the replacement upscale draws over it. Returns whether the replacement ran.
-bool KeplerCompute::FinishDlssEvaluation() {
+bool KeplerCompute::FinishDlssEvaluation(bool output_dispatched) {
     dlss_chain.active = false;
     dlss_chain.output_pass = false;
+    if (dlss_chain.render_region) {
+        dlss_chain.pending.clear();
+        static const bool force_native = [] {
+            const char* option = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
+            return option && std::string_view{option} == "native";
+        }();
+        if (force_native || !output_dispatched) {
+            dlss_motion_vectors.reset();
+            dlss_depth.reset();
+            (void)fe_upscale_jitter.Take();
+            dusk_dlss_reset = true;
+            if (!force_native) {
+                ReportDuskTemporalResult("native output and companion history were not dispatched");
+            }
+            return false;
+        }
+        const bool replaced = TryFireEmblemUpscale();
+        dusk_dlss_reset = !replaced;
+        return replaced;
+    }
     if (dlss_chain.spatial_only) {
         dlss_chain.pending.clear();
         using namespace VideoCommon::FireEmblemUpscale;
@@ -913,73 +994,152 @@ void KeplerCompute::DescribeNativeResources(const NativeQmdScheduler::Descriptor
 
 std::atomic<u32> g_nx2_trace_draws_after_upscale{};
 
+bool KeplerCompute::ValidateDlssConstants(GPUVAddr address, u32 minimum, u32 mapped_size,
+                                         bool trace) {
+    const u32 size = launch_description.const_buffer_config[0].size.Value();
+    if (!(launch_description.const_buffer_enable_mask & 1)) {
+        TraceDuskDlss(trace, "cb0 disabled");
+        return false;
+    }
+    if (size < minimum) {
+        TraceDuskDlss(trace, "cb0 too small: size={:#x} required={:#x}", size, minimum);
+        return false;
+    }
+    if (!memory_manager.IsFullyMappedRange(address, mapped_size)) {
+        TraceDuskDlss(trace, "cb0 not fully mapped: address={:#x} bytes={:#x}", address, mapped_size);
+        return false;
+    }
+    return true;
+}
+
+std::optional<Texture::TICEntry> KeplerCompute::ReadDlssTexture(GPUVAddr address, u32 offset,
+                                                               bool trace) {
+    const u32 index = memory_manager.Read<u32>(address + offset) & 0xfffff;
+    if (index > regs.tic.limit) {
+        TraceDuskDlss(trace, "cb0+{:#x}: TIC {} exceeds limit {}", offset, index, regs.tic.limit);
+        return std::nullopt;
+    }
+    if (!memory_manager.IsFullyMappedRange(
+            regs.tic.Address() + u64{index} * sizeof(Texture::TICEntry), sizeof(Texture::TICEntry))) {
+        TraceDuskDlss(trace, "cb0+{:#x}: TIC {} is unmapped", offset, index);
+        return std::nullopt;
+    }
+    const auto tic = GetTICEntry(index);
+    if (trace) {
+        TraceDuskDlss(true, "cb0+{:#x}: TIC {} address={:#x} format={:#x} size={}x{} plain={} "
+                          "block-linear={} type={} depth={} base layer={} max mip={}",
+                      offset, index, tic.Address(), static_cast<u32>(tic.format.Value()),
+                      tic.Width(), tic.Height(), VideoCommon::FireEmblemUpscale::PlainImage(tic),
+                      tic.IsBlockLinear(), static_cast<u32>(tic.texture_type.Value()), tic.Depth(),
+                      tic.BaseLayer(), tic.max_mip_level.Value());
+    }
+    return tic;
+}
+
 // Fire Emblem: Fortune's Weave's first DLSS pass (rejected, before the network) has the input colour
 // at cbuf0+0x278, its motion vectors (R16G16 float, the input's size) at +0x290, its depth (Z32, the
 // input's size) at +0x298 and this frame's camera jitter (x, y; input pixels, Halton bases 2 and 3
 // less 0.5) at +0x1b0.
-void KeplerCompute::RememberDlssMotionVectors() {
+void KeplerCompute::RememberDlssMotionVectors(bool trace) {
+    using namespace VideoCommon::FireEmblemUpscale;
     dlss_motion_vectors.reset();
     dlss_depth.reset();
     const auto& cbuf = launch_description.const_buffer_config[0];
     const GPUVAddr cbuf_address = (GPUVAddr{cbuf.address_high} << 32) | cbuf.address_low;
-    if (!(launch_description.const_buffer_enable_mask & 1) || cbuf.size.Value() < 0x294 ||
-        !memory_manager.IsFullyMappedRange(cbuf_address, cbuf.size.Value())) {
+    const bool dusk = dlss_chain.render_region;
+    const u32 motion_offset = dusk ? DuskbloodsMotionOffset : 0x290;
+    const u32 depth_offset = dusk ? DuskbloodsDepthOffset : 0x298;
+    const u32 minimum = dusk ? depth_offset + sizeof(u32) : motion_offset + sizeof(u32);
+    if (!ValidateDlssConstants(cbuf_address, minimum, dusk ? minimum : cbuf.size.Value(), trace)) {
         return;
     }
-    const auto image = [&](u32 offset) -> std::optional<Texture::TICEntry> {
-        const u32 tic_index = memory_manager.Read<u32>(cbuf_address + offset) & 0xfffff;
-        if (tic_index > regs.tic.limit || !memory_manager.IsFullyMappedRange(
-                regs.tic.Address() + u64{tic_index} * sizeof(Texture::TICEntry),
-                sizeof(Texture::TICEntry))) {
-            return std::nullopt;
-        }
-        return GetTICEntry(tic_index);
-    };
-    const auto color = image(0x278), motion = image(0x290);
+    const auto color = ReadDlssTexture(cbuf_address, PrepassColorOffset, trace);
+    const auto motion = ReadDlssTexture(cbuf_address, motion_offset, trace);
     if (!color || !motion || color->format != Texture::TextureFormat::B10G11R11 ||
         motion->format != Texture::TextureFormat::R16G16 || motion->Address() == 0 ||
         motion->Width() != color->Width() || motion->Height() != color->Height() ||
-        !motion->IsBlockLinear())
+        !motion->IsBlockLinear() ||
+        (dusk && (!IsDuskTemporalImage(*motion) || motion->r_type != Texture::ComponentType::FLOAT ||
+                  motion->g_type != Texture::ComponentType::FLOAT))) {
+        TraceDuskDlss(trace, "motion rejected: requires B10G11R11 colour and nonzero, "
+                            "block-linear R16G16 motion of the same extent (colour TIC={} motion TIC={})",
+                      color.has_value(), motion.has_value());
         return;
+    }
+    if (dusk) {
+        dusk_dlss_render_size = {
+            memory_manager.Read<u32>(cbuf_address + DuskbloodsRenderWidthOffset),
+            memory_manager.Read<u32>(cbuf_address + DuskbloodsRenderHeightOffset),
+        };
+        for (u32 axis = 0; axis < 2; ++axis) {
+            const u32 word = axis * sizeof(f32);
+            const f32 bias = std::bit_cast<f32>(
+                memory_manager.Read<u32>(cbuf_address + DuskbloodsMotionBiasOffset + word));
+            const f32 multiplier = std::bit_cast<f32>(
+                memory_manager.Read<u32>(cbuf_address + DuskbloodsMotionMultiplierOffset + word));
+            if (bias != 0.0f || !std::isfinite(multiplier) || multiplier == 0.0f) {
+                TraceDuskDlss(trace, "unsupported motion constants on axis {}: bias={} multiplier={}",
+                              axis, bias, multiplier);
+                return;
+            }
+            dusk_dlss_motion_multiplier[axis] = multiplier;
+        }
+    }
     dlss_motion_vectors = *motion;
     dlss_motion_color = color->Address();
-    const u32 depth_offset = dlss_chain.render_region ? 0x288 : 0x298;
-    const auto depth = cbuf.size.Value() >= 0x29c ? image(depth_offset) : std::nullopt;
-    if (depth && depth->format == Texture::TextureFormat::Z32 && depth->Address() != 0 &&
+    const auto depth = cbuf.size.Value() >= depth_offset + sizeof(u32)
+                           ? ReadDlssTexture(cbuf_address, depth_offset, trace)
+                           : std::nullopt;
+    const bool depth_format = depth && (dusk
+        ? VideoCommon::PixelFormatFromTextureInfo(depth->format, depth->r_type, depth->g_type,
+                                                  depth->b_type, depth->a_type,
+                                                  depth->srgb_conversion != 0) ==
+              VideoCore::Surface::PixelFormat::D24_UNORM_S8_UINT
+        : depth->format == Texture::TextureFormat::Z32);
+    if (depth_format && depth->Address() != 0 &&
         depth->Width() == color->Width() && depth->Height() == color->Height() &&
-        depth->IsBlockLinear()) {
+        depth->IsBlockLinear() && (!dusk || IsDuskTemporalImage(*depth))) {
         dlss_depth = *depth;
     } else {
         dlss_depth.reset();
+        TraceDuskDlss(trace, "depth unavailable: expected {} and colour backing extent",
+                      dusk ? "D24S8" : "Z32");
     }
 }
 
-void KeplerCompute::CaptureFireEmblemJitter() {
+void KeplerCompute::CaptureFireEmblemJitter(bool trace) {
     using namespace VideoCommon::FireEmblemUpscale;
     (void)fe_upscale_jitter.Take();
     dlss_motion_vectors.reset();
     dlss_depth.reset();
     const auto& cbuf = launch_description.const_buffer_config[0];
     const GPUVAddr address = (GPUVAddr{cbuf.address_high} << 32) | cbuf.address_low;
-    if (!(launch_description.const_buffer_enable_mask & 1) || cbuf.size.Value() < 0x27c ||
-        !memory_manager.IsFullyMappedRange(address, 0x27c)) {
+    TraceDuskDlss(trace, "prepass: cb0={:#x} size={:#x} colour={:#x} jitter={:#x}/{:#x}",
+                  address, cbuf.size.Value(), PrepassColorOffset, JitterOffset,
+                  JitterOffset + sizeof(f32));
+    if (!ValidateDlssConstants(address, 0x27c, 0x27c, trace)) {
         return;
     }
-    const u32 index = memory_manager.Read<u32>(address + PrepassColorOffset) & 0xfffff;
-    if (index > regs.tic.limit || !memory_manager.IsFullyMappedRange(
-            regs.tic.Address() + u64{index} * sizeof(Texture::TICEntry), sizeof(Texture::TICEntry))) {
+    const auto color = ReadDlssTexture(address, PrepassColorOffset, trace);
+    if (!color || !ValidInput(*color, dlss_chain.spatial_only)) {
+        TraceDuskDlss(trace, "prepass input rejected: requires a block-linear B10G11R11 TIC");
         return;
     }
-    const auto color = GetTICEntry(index);
-    if (!ValidInput(color, dlss_chain.spatial_only)) {
-        return;
+    const std::array offsets{
+        std::bit_cast<f32>(memory_manager.Read<u32>(address + JitterOffset)),
+        std::bit_cast<f32>(memory_manager.Read<u32>(address + JitterOffset + sizeof(f32))),
+    };
+    const bool jitter =
+        fe_upscale_jitter.Capture(color->Address(), color->Width(), color->Height(), offsets);
+    if (!jitter) {
+        TraceDuskDlss(trace, "jitter rejected: requires nonzero colour address and dimensions "
+                            "and finite offsets in [-0.5, 0.5]");
     }
-    fe_upscale_jitter.Capture(color.Address(), color.Width(), color.Height(),
-        {std::bit_cast<f32>(memory_manager.Read<u32>(address + JitterOffset)),
-         std::bit_cast<f32>(memory_manager.Read<u32>(address + JitterOffset + sizeof(f32)))});
     if (!dlss_chain.spatial_only) {
-        RememberDlssMotionVectors();
+        RememberDlssMotionVectors(trace);
     }
+    TraceDuskDlss(trace, "prepass inputs: jitter={} ({}, {}) motion={} depth={}", jitter, offsets[0],
+                  offsets[1], dlss_motion_vectors.has_value(), dlss_depth.has_value());
 }
 
 void KeplerCompute::TraceDlssContract(u64 native_key, bool warn_unvalidated) {
@@ -1033,7 +1193,14 @@ void KeplerCompute::TraceDlssContract(u64 native_key, bool warn_unvalidated) {
     }
 }
 
-// Scales the region the game rendered up to the output, in place of the network's output pass.
+void KeplerCompute::ReportDuskTemporalResult(const char* failure) {
+    const std::string_view outcome = failure ? failure : "FSR 3.1 and output handoff recorded";
+    if (dusk_dlss_trace_output || dusk_dlss_results.insert(outcome).second) {
+        TraceDuskDlss(true, "temporal result: {}", outcome);
+    }
+}
+
+// Replace the native result only after recording temporal reconstruction of both active regions.
 bool KeplerCompute::ScaleDlssRenderRegion(GPUVAddr constants,
                                           const std::optional<Texture::TICEntry>& input,
                                           const std::optional<Texture::TICEntry>& output,
@@ -1041,18 +1208,52 @@ bool KeplerCompute::ScaleDlssRenderRegion(GPUVAddr constants,
                                           const std::optional<Texture::TICEntry>& motion,
                                           const std::optional<Texture::TICEntry>& depth) {
     using namespace VideoCommon::FireEmblemUpscale;
-    if (!input || !output || !PlainImage(*input) || !PlainImage(*output) ||
-        input->format != Texture::TextureFormat::B10G11R11 ||
-        output->format != Texture::TextureFormat::B10G11R11 ||
-        input->Address() == output->Address() ||
-        launch_description.const_buffer_config[0].size.Value() < RenderLastColumnOffset + 4 ||
-        !memory_manager.IsFullyMappedRange(constants, RenderLastColumnOffset + 4)) {
+    const bool trace = dusk_dlss_trace_output;
+    const auto reject = [this](const char* reason) {
+        ReportDuskTemporalResult(reason);
         return false;
+    };
+    if (!input || !output) {
+        return reject("scene color or output descriptor is unavailable");
     }
-    const u32 width = memory_manager.Read<u32>(constants + RenderLastColumnOffset) + 1;
-    const u32 height = memory_manager.Read<u32>(constants + RenderLastRowOffset) + 1;
-    if (width == 0 || height == 0 || width > input->Width() || height > input->Height()) {
-        return false;
+    if (!IsDuskTemporalImage(*input) || !IsDuskTemporalImage(*output)) {
+        return reject("scene color or output descriptor is not a plain single-sampled image");
+    }
+    if (input->format != Texture::TextureFormat::B10G11R11 ||
+        output->format != Texture::TextureFormat::B10G11R11) {
+        return reject("scene color and output must both be B10G11R11");
+    }
+    if (input->Address() == output->Address()) {
+        return reject("scene color and output share the same address");
+    }
+    constexpr u32 required_size = RenderLastColumnOffset + sizeof(u32);
+    if (!ValidateDlssConstants(constants, required_size, required_size, trace)) {
+        return reject("output extent constants are unavailable");
+    }
+    const VideoCommon::DlssContract::TemporalRegions regions{
+        .render = {memory_manager.Read<u32>(constants + RenderLastColumnOffset) + 1,
+                   memory_manager.Read<u32>(constants + RenderLastRowOffset) + 1},
+        .output = {memory_manager.Read<u32>(constants + DuskbloodsOutputWidthOffset),
+                   memory_manager.Read<u32>(constants + DuskbloodsOutputHeightOffset)},
+        .reset = dusk_dlss_reset,
+    };
+    TraceDuskDlss(trace, "input {}x{} of {}x{}, output {}x{} of {}x{}",
+                  regions.render[0], regions.render[1], input->Width(), input->Height(),
+                  regions.output[0], regions.output[1], output->Width(), output->Height());
+    if (!VideoCommon::DlssContract::ValidRegions(
+            regions, {input->Width(), input->Height()}, {output->Width(), output->Height()})) {
+        return reject("active input or output exceeds its bounds");
+    }
+    if (!jitter || !motion || !depth) {
+        return reject(!jitter ? "missing current jitter" : !motion ? "missing current scene motion"
+                                                                  : "missing current scene depth");
+    }
+    if (jitter->color != input->Address() || dlss_motion_color != input->Address() ||
+        jitter->width != input->Width() || jitter->height != input->Height()) {
+        return reject("scene color differs between prepass and output");
+    }
+    if (dusk_dlss_render_size != regions.render) {
+        return reject("active input extent differs between prepass and output");
     }
     const auto surface = [](const Texture::TICEntry& tic) {
         Fermi2D::Surface result{};
@@ -1068,37 +1269,21 @@ bool KeplerCompute::ScaleDlssRenderRegion(GPUVAddr constants,
         result.addr_lower = static_cast<u32>(tic.Address());
         return result;
     };
-    if (!jitter || !motion) {
-        return false;
-    }
     Fermi2D::Surface motion_surface = surface(*motion);
     motion_surface.format = Tegra::RenderTargetFormat::R16G16_FLOAT;
-    // The game's motion vectors point from the previous position to the current one (a rightward
-    // pan gives negative x while the scene moves left), the reverse of what the upscale expects.
-    // Test switches: EDEN_NX2_DLSS_MOTION_SCALE=<x>,<y> and EDEN_NX2_DLSS_HISTORY=0 (de-jitter only).
-    static const std::array<f32, 2> motion_scale = [] {
-        std::array<f32, 2> scale{-1.0f, -1.0f};
-        if (const char* value = std::getenv("EDEN_NX2_DLSS_MOTION_SCALE")) {
-            char* end{};
-            scale[0] = static_cast<f32>(std::strtod(value, &end));
-            scale[1] = *end == ',' ? static_cast<f32>(std::strtod(end + 1, nullptr)) : scale[0];
-        }
-        return scale;
-    }();
-    static const bool use_history = [] {
-        const char* value = std::getenv("EDEN_NX2_DLSS_HISTORY");
-        return !(value && std::string_view{value} == "0");
-    }();
+    // The native prepass adds scaled motion to network pixel centers for history lookups.
+    const std::array motion_scale{
+        dusk_dlss_motion_multiplier[0] / static_cast<f32>(regions.output[0]),
+        dusk_dlss_motion_multiplier[1] / static_cast<f32>(regions.output[1]),
+    };
+    TraceDuskDlss(trace, "temporal inputs: jitter=({}, {}) motion scale=({}, {}) reset={}",
+                  jitter->offset[0], jitter->offset[1], motion_scale[0], motion_scale[1],
+                  regions.reset);
+    const char* failure = "rasterizer does not support temporal upscale";
     const bool done = rasterizer->AccelerateTemporalUpscale(
-        surface(*input), surface(*output), motion_surface, depth ? &*depth : nullptr,
-        jitter->offset, motion_scale, use_history, std::array{width, height});
-    static u32 last_width{};
-    if (width != last_width) {
-        last_width = width;
-        LOG_INFO(HW_GPU, "DLSS replacement: {} region {}x{} of {}x{} to {}x{}",
-                 done ? "scaled" : "could not scale", width, height, input->Width(),
-                 input->Height(), output->Width(), output->Height());
-    }
+        surface(*input), surface(*output), motion_surface, &*depth, jitter->offset, motion_scale,
+        true, regions, &failure);
+    ReportDuskTemporalResult(done ? nullptr : failure);
     return done;
 }
 
@@ -1114,7 +1299,12 @@ bool KeplerCompute::TryFireEmblemUpscale(bool allow_history) {
     const auto jitter = fe_upscale_jitter.Take();
     const auto motion = std::exchange(dlss_motion_vectors, std::nullopt);
     const auto depth = std::exchange(dlss_depth, std::nullopt);
-    if (!jitter || (use_history && (!motion || !depth))) {
+    const bool trace = dusk_dlss_trace_output;
+    const auto& cbuf = launch_description.const_buffer_config[0];
+    const GPUVAddr address = (GPUVAddr{cbuf.address_high} << 32) | cbuf.address_low;
+    if (!dlss_chain.render_region && (!jitter || (use_history && (!motion || !depth)))) {
+        TraceDuskDlss(trace, "replacement rejected: {}",
+                      !jitter ? "missing jitter" : "explicit temporal mode requires motion and depth");
         static std::array<bool, 2> reported{};
         if (!reported[game_index]) {
             reported[game_index] = true;
@@ -1123,22 +1313,14 @@ bool KeplerCompute::TryFireEmblemUpscale(bool allow_history) {
         }
         return false;
     }
-    const auto& cbuf = launch_description.const_buffer_config[0];
-    const GPUVAddr address = (GPUVAddr{cbuf.address_high} << 32) | cbuf.address_low;
-    if (!(launch_description.const_buffer_enable_mask & 1) || cbuf.size.Value() < 0x34c ||
-        !memory_manager.IsFullyMappedRange(address, 0x34c)) {
+    if (!ValidateDlssConstants(address, 0x34c, 0x34c, trace)) {
+        if (dlss_chain.render_region) {
+            ReportDuskTemporalResult("output resource constants are unavailable");
+        }
         return false;
     }
-    const auto image = [&](u32 offset) -> std::optional<Texture::TICEntry> {
-        const u32 index = memory_manager.Read<u32>(address + offset) & 0xfffff;
-        if (index > regs.tic.limit || !memory_manager.IsFullyMappedRange(
-                regs.tic.Address() + u64{index} * sizeof(Texture::TICEntry), sizeof(Texture::TICEntry))) {
-            return std::nullopt;
-        }
-        return GetTICEntry(index);
-    };
-    const auto input = image(OutputColorInputOffset);
-    const auto output = image(OutputColorOffset);
+    const auto input = ReadDlssTexture(address, OutputColorInputOffset, trace);
+    const auto output = ReadDlssTexture(address, OutputColorOffset, trace);
     if (dlss_chain.render_region) {
         return ScaleDlssRenderRegion(address, input, output, jitter, motion, depth);
     }

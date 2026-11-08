@@ -27,6 +27,7 @@
 #include <queue>
 
 #include "common/common_types.h"
+#include "video_core/dlss_contract.h"
 #include "common/spin_recursive_mutex.h"
 #include "common/hash.h"
 #include "common/literals.h"
@@ -333,7 +334,7 @@ public:
                          const Tegra::Engines::Fermi2D::Surface& motion_vectors,
                          const Tegra::Texture::TICEntry* depth, std::array<f32, 2> jitter,
                          std::array<f32, 2> motion_scale, bool use_history,
-                         std::optional<std::array<u32, 2>> render_region = std::nullopt);
+                         std::optional<VideoCommon::DlssContract::TemporalRegions> regions, const char** failure);
 
     /// Health check of a game's DLSS network output (dst) against its input (src); see the
     /// runtime's ProbeGameDlssOutput. Returns an earlier check's result when one is ready.

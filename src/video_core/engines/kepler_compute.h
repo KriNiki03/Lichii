@@ -12,6 +12,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string_view>
 #include <unordered_set>
 #include <vector>
 #include "common/bit_field.h"
@@ -282,15 +283,18 @@ private:
     bool DispatchNativeCompute(const NativeQmdScheduler::Descriptor& descriptor);
     void ProcessNativeReportSemaphore(u32 argument);
     void DescribeNativeResources(const NativeQmdScheduler::Descriptor& qmd);
-    void RememberDlssMotionVectors();
+    bool ValidateDlssConstants(GPUVAddr address, u32 minimum, u32 mapped_size, bool trace);
+    std::optional<Texture::TICEntry> ReadDlssTexture(GPUVAddr address, u32 offset, bool trace);
+    void RememberDlssMotionVectors(bool trace);
     bool TryFireEmblemUpscale(bool allow_history = true);
+    void ReportDuskTemporalResult(const char* failure);
     bool ScaleDlssRenderRegion(GPUVAddr constants, const std::optional<Texture::TICEntry>& input,
                                const std::optional<Texture::TICEntry>& output,
                                const std::optional<VideoCommon::FireEmblemUpscale::JitterSample>& jitter,
                                const std::optional<Texture::TICEntry>& motion,
                                const std::optional<Texture::TICEntry>& depth);
-    void CaptureFireEmblemJitter();
-    bool FinishDlssEvaluation();
+    void CaptureFireEmblemJitter(bool trace);
+    bool FinishDlssEvaluation(bool output_dispatched = true);
     void CheckDlssNetwork();
     [[nodiscard]] VideoCore::GameDlssReason GameDlssBlocker() const;
     void UpdateGameDlssStatus(bool complete, VideoCore::GameDlssReason blocker);
@@ -330,6 +334,16 @@ private:
     std::optional<Texture::TICEntry> dlss_motion_vectors;
     std::optional<Texture::TICEntry> dlss_depth;
     u32 dlss_contract_trace_count{};
+    u32 dusk_dlss_prepass_logs{};
+    u32 dusk_dlss_output_logs{};
+    u32 dusk_dlss_rejection_logs{};
+    bool dusk_dlss_seen{};
+    bool dusk_dlss_expiry_logged{};
+    bool dusk_dlss_trace_output{};
+    bool dusk_dlss_reset = true;
+    std::array<f32, 2> dusk_dlss_motion_multiplier{};
+    std::array<u32, 2> dusk_dlss_render_size{};
+    std::unordered_set<std::string_view> dusk_dlss_results;
     GPUVAddr dlss_motion_color{};
     VideoCommon::FireEmblemUpscale::FrameJitter fe_upscale_jitter;
     bool ProcessNativeMethod(Core::System& system, u32 method, u32 argument, bool is_last_call);

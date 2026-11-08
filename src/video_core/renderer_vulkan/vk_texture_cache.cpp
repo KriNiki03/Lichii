@@ -1773,44 +1773,59 @@ bool TextureCacheRuntime::UpscaleWithFsr3(Framebuffer* dst_framebuffer, ImageVie
                                           ImageView& motion_vectors, ImageView& depth,
                                           std::array<u32, 2> render_size,
                                           std::array<f32, 2> jitter,
-                                          std::array<f32, 2> motion_scale) {
-    if (!WantsTemporalUpscaleDepth()) {
+                                          std::array<f32, 2> motion_scale,
+                                          std::optional<VideoCommon::DlssContract::TemporalRegions> regions,
+                                          const char** failure) {
+    const auto reject = [failure](const char* reason) {
+        if (failure) {
+            *failure = reason;
+        }
         return false;
+    };
+    if (!regions && !WantsTemporalUpscaleDepth()) {
+        return reject("temporal backend is disabled");
     }
-    const VkExtent2D extent = dst_framebuffer->RenderArea();
+    // The FSR luminance pyramid binds six mip levels of a half-resolution image.
+    if (std::max(render_size[0], render_size[1]) < 64) {
+        return reject("FSR 3.1 input is too small for its luminance pyramid");
+    }
+    const VkExtent2D extent = regions ? VkExtent2D{regions->output[0], regions->output[1]}
+                                     : dst_framebuffer->RenderArea();
     // A gap in the evaluations (a menu, a movie, a load) starts the history again.
     const auto now = std::chrono::steady_clock::now();
     const f32 frame_time_ms =
         fsr3_last_evaluation
             ? std::chrono::duration<f32, std::milli>(now - *fsr3_last_evaluation).count()
             : 1000.0f / 30.0f;
-    const bool reset = !fsr3_last_evaluation || frame_time_ms > 250.0f;
-    fsr3_last_evaluation = now;
+    const bool reset = !fsr3_last_evaluation || frame_time_ms > 250.0f ||
+                       (regions && regions->reset);
 #ifdef EGLANTINE_STREAMLINE
-    if (UpscaleWithDlss(dst_framebuffer, input_color, motion_vectors, depth, render_size, jitter,
-                        motion_scale, reset)) {
+    if (!regions && UpscaleWithDlss(dst_framebuffer, input_color, motion_vectors, depth, render_size,
+                                    jitter, motion_scale, reset)) {
+        fsr3_last_evaluation = now;
         return true;
     }
 #endif
     if (fsr3_unsupported) {
-        return false;
+        return reject("FSR 3.1 is unavailable");
     }
     if (!fsr3_upscaler) {
         if (!Fsr3Upscaler::IsSupported(device)) {
-            LOG_WARNING(Render_Vulkan, "FSR 3.1 needs formats or features this device lacks; "
-                                       "using the temporal stand-in");
+            LOG_WARNING(Render_Vulkan, "FSR 3.1 needs formats or features this device lacks");
             fsr3_unsupported = true;
-            return false;
+            return reject("FSR 3.1 device requirements are unmet");
         }
         try {
             fsr3_upscaler = std::make_unique<Fsr3Upscaler>(device, scheduler, memory_allocator,
                                                            staging_buffer_pool, descriptor_pool,
                                                            compute_pass_descriptor_queue);
         } catch (const vk::Exception& exception) {
-            LOG_ERROR(Render_Vulkan, "FSR 3.1 failed to start ({}); using the temporal stand-in",
-                      exception.what());
+            if (regions && exception.GetResult() == VK_ERROR_DEVICE_LOST) {
+                throw;
+            }
+            LOG_ERROR(Render_Vulkan, "FSR 3.1 failed to start ({})", exception.what());
             fsr3_unsupported = true;
-            return false;
+            return reject("FSR 3.1 initialization failed");
         }
     }
     // FSR's own RCAS, set by the sharpness slider: FSR takes 0-1 for 2 to 0 stops, and the slider
@@ -1825,10 +1840,16 @@ bool TextureCacheRuntime::UpscaleWithFsr3(Framebuffer* dst_framebuffer, ImageVie
         stops = static_cast<f32>(std::strtod(sharpen_override, nullptr));
     }
     try {
+        const VkImageView color_view = input_color.Handle(Shader::TextureType::Color2D);
+        const VkImageView depth_view = depth.DepthView();
+        const VkImageView motion_view = motion_vectors.Handle(Shader::TextureType::Color2D);
+        if (!color_view || !depth_view || !motion_view) {
+            return reject("FSR 3.1 sampled input view is unavailable");
+        }
         fsr3_upscaler->Upscale({
-            .color = input_color.Handle(Shader::TextureType::Color2D),
-            .depth = depth.DepthView(),
-            .motion_vectors = motion_vectors.Handle(Shader::TextureType::Color2D),
+            .color = color_view,
+            .depth = depth_view,
+            .motion_vectors = motion_view,
             .render_size = {render_size[0], render_size[1]},
             .upscale_size = extent,
             .jitter = jitter,
@@ -1839,14 +1860,17 @@ bool TextureCacheRuntime::UpscaleWithFsr3(Framebuffer* dst_framebuffer, ImageVie
             .sharpen = sharpen,
             .sharpness = 1.0f - stops / 2.0f,
         });
+        DrawUpscaledOutput(dst_framebuffer, fsr3_upscaler->OutputView(),
+                           fsr3_upscaler->OutputImage(), fsr3_upscaler->PointSampler(), extent);
     } catch (const vk::Exception& exception) {
-        LOG_ERROR(Render_Vulkan, "FSR 3.1 evaluation unavailable ({}); using the temporal stand-in",
-                  exception.what());
+        if (regions && exception.GetResult() == VK_ERROR_DEVICE_LOST) {
+            throw;
+        }
+        LOG_ERROR(Render_Vulkan, "FSR 3.1 evaluation unavailable ({})", exception.what());
         fsr3_unsupported = true;
-        return false;
+        return reject("FSR 3.1 evaluation or output recording failed");
     }
-    DrawUpscaledOutput(dst_framebuffer, fsr3_upscaler->OutputView(), fsr3_upscaler->OutputImage(),
-                       fsr3_upscaler->PointSampler());
+    fsr3_last_evaluation = now;
     static bool logged{};
     if (!logged) {
         logged = true;
@@ -1857,19 +1881,39 @@ bool TextureCacheRuntime::UpscaleWithFsr3(Framebuffer* dst_framebuffer, ImageVie
 }
 
 void TextureCacheRuntime::DrawUpscaledOutput(Framebuffer* dst_framebuffer, VkImageView view,
-                                             VkImage output, VkSampler sampler) {
+                                             VkImage output, VkSampler sampler, VkExtent2D extent) {
     // Draw the result into the DLSS output, which keeps its own format; the blit leaves the
     // upscaler's output image in SHADER_READ_ONLY_OPTIMAL, so return it to GENERAL for the next
     // frame.
-    const VkExtent2D extent = dst_framebuffer->RenderArea();
     const Region2D region{
         .start = {0, 0},
         .end = {static_cast<s32>(extent.width), static_cast<s32>(extent.height)},
     };
+    // The format-conversion draw uses a standalone render pass, outside scheduler tracking.
+    const VkImageMemoryBarrier destination{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = dst_framebuffer->Images().front(),
+        .subresourceRange = dst_framebuffer->ImageRanges().front(),
+    };
+    scheduler.RequestOutsideRenderPassOperationContext();
+    scheduler.Record([destination](vk::CommandBuffer cmdbuf) {
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                               VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, destination);
+    });
     blit_image_helper.BlitColor(dst_framebuffer, view, output, sampler, region, region,
                                 {extent.width, extent.height, 1});
-    scheduler.RequestOutsideRenderPassOperationContext();
-    scheduler.Record([output](vk::CommandBuffer cmdbuf) {
+    scheduler.Record([output, destination](vk::CommandBuffer cmdbuf) {
+        auto ready = destination;
+        ready.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        ready.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                               VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, ready);
         const VkImageMemoryBarrier barrier{
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
             .pNext = nullptr,
@@ -1965,7 +2009,7 @@ bool TextureCacheRuntime::UpscaleWithDlss(Framebuffer* dst_framebuffer, ImageVie
         return false;
     }
     DrawUpscaledOutput(dst_framebuffer, dlss_upscaler->OutputView(), dlss_upscaler->OutputImage(),
-                       dlss_upscaler->PointSampler());
+                       dlss_upscaler->PointSampler(), extent);
     static bool logged{};
     if (!logged) {
         logged = true;
@@ -1980,9 +2024,17 @@ bool TextureCacheRuntime::TemporalUpscale(Framebuffer* dst_framebuffer, ImageVie
                                           ImageView& input_color, ImageView& motion_vectors,
                                           ImageView* depth, std::array<u32, 2> render_size,
                                           std::array<f32, 2> jitter,
-                                          std::array<f32, 2> motion_scale, bool use_history) {
-    if (dst.Samples() != VK_SAMPLE_COUNT_1_BIT || ImageAspectMask(dst.format) != VK_IMAGE_ASPECT_COLOR_BIT) {
+                                          std::array<f32, 2> motion_scale, bool use_history,
+                                          std::optional<VideoCommon::DlssContract::TemporalRegions> regions,
+                                          const char** failure) {
+    const auto reject = [failure](const char* reason) {
+        if (failure) {
+            *failure = reason;
+        }
         return false;
+    };
+    if (dst.Samples() != VK_SAMPLE_COUNT_1_BIT || ImageAspectMask(dst.format) != VK_IMAGE_ASPECT_COLOR_BIT) {
+        return reject("Vulkan destination is multisampled or lacks a colour aspect");
     }
     const auto plain = [](const ImageView& view) {
         return view.Samples() == VK_SAMPLE_COUNT_1_BIT && view.range.base.level == 0 &&
@@ -1998,31 +2050,47 @@ bool TextureCacheRuntime::TemporalUpscale(Framebuffer* dst_framebuffer, ImageVie
             : std::array{view.size.width, view.size.height};
         return VideoCommon::DlssContract::FitsExtent(requested, extent);
     };
-    const VkExtent2D output_extent = dst_framebuffer->RenderArea();
-    if (!plain(dst) || !plain(input_color) || !fits(input_color, render_size) ||
-        !fits(dst, {output_extent.width, output_extent.height}) ||
-        !VideoCommon::DlssContract::ValidColorFormats(input_color.format, dst.format, use_history) ||
-        input_color.ImageHandle() == dst.ImageHandle() ||
-        !VideoCommon::DlssContract::ValidGeometry(render_size,
-                                                 {output_extent.width, output_extent.height},
-                                                 jitter, motion_scale)) {
-        return false;
+    const VkExtent2D framebuffer_extent = dst_framebuffer->RenderArea();
+    const std::array output_extent = regions ? regions->output
+        : std::array{framebuffer_extent.width, framebuffer_extent.height};
+    if (!plain(dst) || !plain(input_color)) {
+        return reject("Vulkan colour views must be single-sampled with base mip and layer zero");
+    }
+    if (!fits(input_color, render_size)) {
+        return reject("Vulkan input colour has no backing image or its extent is too small");
+    }
+    if (!fits(dst, output_extent) ||
+        !VideoCommon::DlssContract::FitsExtent(
+            output_extent, {framebuffer_extent.width, framebuffer_extent.height})) {
+        return reject("Vulkan output has no backing image or its extent is too small");
+    }
+    if (!VideoCommon::DlssContract::ValidColorFormats(input_color.format, dst.format, use_history)) {
+        return reject("Vulkan colour formats do not match the upscale contract");
+    }
+    if (input_color.ImageHandle() == dst.ImageHandle()) {
+        return reject("Vulkan input and output resolve to the same image");
+    }
+    if (!VideoCommon::DlssContract::ValidGeometry(render_size, output_extent, jitter, motion_scale)) {
+        return reject("Vulkan render extent is smaller than 2x2, exceeds output, or offsets are nonfinite");
     }
     if (use_history && (!plain(motion_vectors) || !fits(motion_vectors, render_size) ||
                         motion_vectors.format != PixelFormat::R16G16_FLOAT ||
                         input_color.size.width != motion_vectors.size.width ||
                         input_color.size.height != motion_vectors.size.height)) {
-        return false;
+        return reject("Vulkan motion view fails base mip/layer, sample count, format or extent checks");
     }
     if (use_history && depth && (!plain(*depth) || !fits(*depth, render_size) ||
-                                depth->format != PixelFormat::D32_FLOAT ||
+                                !VideoCommon::DlssContract::ValidDepthFormat(depth->format,
+                                                                             regions.has_value()) ||
                                 input_color.size.width != depth->size.width ||
                                 input_color.size.height != depth->size.height)) {
-        return false;
+        return reject("Vulkan depth view fails base mip/layer, sample count, format or extent checks");
     }
-    if (use_history && depth && UpscaleWithFsr3(dst_framebuffer, input_color, motion_vectors, *depth, render_size,
-                                 jitter, motion_scale)) {
-        return true;
+    const bool temporal = use_history && depth &&
+        UpscaleWithFsr3(dst_framebuffer, input_color, motion_vectors, *depth, render_size,
+                        jitter, motion_scale, regions, failure);
+    if (regions || temporal) {
+        return temporal;
     }
     const VkFormat format =
         MaxwellToVK::SurfaceFormat(device, FormatType::Optimal, false, dst.format).format;

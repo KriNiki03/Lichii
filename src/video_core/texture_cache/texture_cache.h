@@ -1347,13 +1347,24 @@ bool TextureCache<P>::TemporalUpscale(const Tegra::Engines::Fermi2D::Surface& ds
                                       const Tegra::Texture::TICEntry* depth,
                                       std::array<f32, 2> jitter, std::array<f32, 2> motion_scale,
                                       bool use_history,
-                                      std::optional<std::array<u32, 2>> render_region) {
-    if constexpr (FRAMEBUFFER_BLITS) {
+                                      std::optional<VideoCommon::DlssContract::TemporalRegions> regions,
+                                      const char** failure) {
+    const auto reject = [failure](const char* reason) {
+        if (failure) {
+            *failure = reason;
+        }
         return false;
+    };
+    if constexpr (FRAMEBUFFER_BLITS) {
+        return reject("texture cache uses framebuffer blits");
     } else {
+        if (regions && (!use_history || !depth)) {
+            return reject("temporal subrect requires motion history and depth");
+        }
         const Tegra::Engines::Fermi2D::Config copy{
             .operation = Tegra::Engines::Fermi2D::Operation::SrcCopy,
-            .filter = Tegra::Engines::Fermi2D::Filter::Bilinear,
+            .filter = regions ? Tegra::Engines::Fermi2D::Filter::Point
+                              : Tegra::Engines::Fermi2D::Filter::Bilinear,
             .must_accelerate = true,
             .dst_x0 = 0,
             .dst_y0 = 0,
@@ -1366,7 +1377,7 @@ bool TextureCache<P>::TemporalUpscale(const Tegra::Engines::Fermi2D::Surface& ds
         };
         const auto result = GetBlitImages(dst, src, copy);
         if (!result) {
-            return false;
+            return reject("texture cache could not resolve blit images");
         }
         const auto& motion_surface = use_history ? motion_vectors : src;
         const ImageInfo motion_info(motion_surface);
@@ -1376,30 +1387,38 @@ bool TextureCache<P>::TemporalUpscale(const Tegra::Engines::Fermi2D::Surface& ds
         // The depth only feeds NVIDIA DLSS and FSR 3.1 (looked up only when they can run); without
         // it the stand-in runs.
         ImageId depth_id{};
-        if (use_history && depth && motion_id && runtime.WantsTemporalUpscaleDepth()) {
+        if (use_history && depth && motion_id &&
+            (regions || runtime.WantsTemporalUpscaleDepth())) {
             depth_id = FindOrInsertImage(ImageInfo(*depth), depth->Address(), RelaxedOptions{});
             if (!depth_id) {
-                return false;
+                return reject("texture cache could not resolve requested depth image");
             }
         }
         if (has_deleted_images || !motion_id) {
-            return false;
+            return reject(has_deleted_images ? "image lookup evicted cached images"
+                                             : "texture cache could not resolve motion image");
         }
         const ImageId dst_id = result->dst_id;
         const ImageId src_id = result->src_id;
         PrepareImage(src_id, false, false);
         PrepareImage(motion_id, false, false);
-        PrepareImage(dst_id, true, false);
+        if (regions && True(slot_images[dst_id].flags &
+                            (ImageFlagBits::SparseTiles | ImageFlagBits::SparseLayers |
+                             ImageFlagBits::UnwrittenSparse))) {
+            return reject("temporal subrect output is sparse");
+        }
+        PrepareImage(dst_id, !regions, false);
         if (depth_id) {
             PrepareImage(depth_id, false, false);
             if (slot_images[depth_id].info.num_samples != 1 ||
-                slot_images[depth_id].info.format != PixelFormat::D32_FLOAT) {
-                return false;
+                !DlssContract::ValidDepthFormat(slot_images[depth_id].info.format,
+                                                regions.has_value())) {
+                return reject("cached depth image is multisampled or has an unsupported format");
             }
         }
         for (const ImageId id : {src_id, motion_id, dst_id}) {
             if (slot_images[id].info.num_samples != 1) {
-                return false;
+                return reject("cached colour, motion or output image is multisampled");
             }
         }
         // With resolution scaling, bring the images that can follow to the same scale, as BlitImage
@@ -1418,20 +1437,28 @@ bool TextureCache<P>::TemporalUpscale(const Tegra::Engines::Fermi2D::Surface& ds
         // FSR 3.1 reads colour, motion and depth texel for texel: all at the colour's scale.
         if (depth_id && (rescaled(depth_id) != rescaled(src_id) ||
                          rescaled(motion_id) != rescaled(src_id))) {
-            return false;
+            return reject("cached colour, motion and depth have different resolution scales");
         }
         const Extent3D src_size = slot_images[src_id].info.size;
         if (src_size.width != src.width || src_size.height != src.height) {
-            return false;
+            return reject("cached source extent differs from the guest surface");
         }
         // The game may render only part of its colour target.
         const std::array<u32, 2> guest_size =
-            render_region.value_or(std::array{src_size.width, src_size.height});
+            regions ? regions->render : std::array{src_size.width, src_size.height};
         const std::array<u32, 2> render_size =
             rescaled(src_id)
                 ? std::array{Settings::values.resolution_info.ScaleUp(guest_size[0]),
                              Settings::values.resolution_info.ScaleUp(guest_size[1])}
                 : guest_size;
+        if (regions) {
+            regions->render = render_size;
+            if (rescaled(dst_id)) {
+                auto& output = regions->output;
+                output = {Settings::values.resolution_info.ScaleUp(output[0]),
+                          Settings::values.resolution_info.ScaleUp(output[1])};
+            }
+        }
         // The jitter is in the input's guest pixels.
         if (rescaled(src_id)) {
             const f32 factor = Settings::values.resolution_info.up_factor;
@@ -1450,26 +1477,33 @@ bool TextureCache<P>::TemporalUpscale(const Tegra::Engines::Fermi2D::Surface& ds
         const auto motion_view = view(motion_id, motion_surface, motion_info.format);
         const auto dst_view = view(dst_id, dst, result->dst_format);
         if (!src_view || !motion_view || !dst_view) {
-            return false;
+            return reject(!src_view      ? "cannot resolve cached source view base"
+                          : !motion_view ? "cannot resolve cached motion view base"
+                                         : "cannot resolve cached output view base");
         }
         ImageViewId depth_view{};
         if (depth_id) {
             if (const std::optional base = slot_images[depth_id].TryFindBase(depth->Address())) {
                 const SubresourceRange range{.base = *base, .extent = {1, 1}};
                 depth_view = FindOrEmplaceImageView(
-                    depth_id, ImageViewInfo(ImageViewType::e2D, PixelFormat::D32_FLOAT, range));
+                    depth_id, ImageViewInfo(ImageViewType::e2D, slot_images[depth_id].info.format,
+                                            range));
             }
             if (!depth_view) {
-                return false;
+                return reject("cannot resolve cached depth view");
             }
         }
         // After the views: creating them may reallocate the framebuffer slots.
         Framebuffer* const dst_framebuffer = &slot_framebuffers[dst_view->first];
-        return runtime.TemporalUpscale(
+        const bool done = runtime.TemporalUpscale(
             dst_framebuffer, slot_image_views[dst_view->second], slot_image_views[src_view->second],
             slot_image_views[motion_view->second],
             depth_view ? &slot_image_views[depth_view] : nullptr, render_size, jitter,
-            motion_scale, use_history);
+            motion_scale, use_history, regions, failure);
+        if (regions && done) {
+            MarkModification(dst_id);
+        }
+        return done;
     }
 }
 

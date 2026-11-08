@@ -28,6 +28,14 @@ constexpr u32 OutputColorInputOffset = 0x328;
 constexpr u32 OutputColorOffset = 0x348;
 constexpr u32 RenderLastRowOffset = 0x394;
 constexpr u32 RenderLastColumnOffset = 0x39c;
+constexpr u32 DuskbloodsMotionOffset = 0x284;
+constexpr u32 DuskbloodsDepthOffset = 0x288;
+constexpr u32 DuskbloodsMotionMultiplierOffset = 0x198;
+constexpr u32 DuskbloodsMotionBiasOffset = 0x1a0;
+constexpr u32 DuskbloodsRenderWidthOffset = 0x1e8;
+constexpr u32 DuskbloodsRenderHeightOffset = 0x1ec;
+constexpr u32 DuskbloodsOutputHeightOffset = 0x358;
+constexpr u32 DuskbloodsOutputWidthOffset = 0x35c;
 
 struct Passes {
     u64 prepass;
@@ -59,14 +67,15 @@ struct JitterSample {
 
 class FrameJitter {
 public:
-    void Capture(GPUVAddr color, u32 width, u32 height, std::array<f32, 2> offset) {
+    bool Capture(GPUVAddr color, u32 width, u32 height, std::array<f32, 2> offset) {
         sample.reset();
         if (color == 0 || width == 0 || height == 0 ||
             !std::isfinite(offset[0]) || !std::isfinite(offset[1]) ||
             std::abs(offset[0]) > 0.5f || std::abs(offset[1]) > 0.5f) {
-            return;
+            return false;
         }
         sample = JitterSample{color, width, height, offset};
+        return true;
     }
 
     // Consume on every output attempt, even if its resources cannot be used.
