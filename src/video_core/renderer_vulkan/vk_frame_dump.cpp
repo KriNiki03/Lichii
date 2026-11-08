@@ -31,7 +31,15 @@ namespace {
 
 using VideoCore::Surface::PixelFormat;
 
-constexpr size_t SIZE_CAP = size_t{2} << 30;
+/// The most one capture reads back: 2 GiB, or EDEN_NX2_FRAME_DUMP_CAP_GIB.
+size_t SizeCap() {
+    static const size_t cap = [] {
+        const char* const value = std::getenv("EDEN_NX2_FRAME_DUMP_CAP_GIB");
+        const unsigned long gib = value ? std::strtoul(value, nullptr, 10) : 0;
+        return size_t{gib ? gib : 2} << 30;
+    }();
+    return cap;
+}
 /// RecordingSampledTextures: a sampled capture is running.
 std::atomic<bool> recording_sampled{};
 constexpr size_t STAGING_BUDGET = size_t{256} << 20;
@@ -574,7 +582,7 @@ bool FrameDump::Record(const Target& target, std::string name, std::string tags)
         return false;
     }
     const size_t size = size_t{target.width} * target.height * target.depth * TexelBytes(target);
-    if (recorded_bytes + size > SIZE_CAP) {
+    if (recorded_bytes + size > SizeCap()) {
         truncated = true;
         return false;
     }
@@ -628,7 +636,7 @@ bool FrameDump::Record(const Target& target, std::string name, std::string tags)
 }
 
 bool FrameDump::RecordBuffer(VkBuffer source, u32 offset, u32 size, std::string tags) {
-    if (recorded_bytes + size > SIZE_CAP) {
+    if (recorded_bytes + size > SizeCap()) {
         truncated = true;
         return false;
     }
@@ -727,7 +735,7 @@ void FrameDump::WriterLoop() {
             manifest.close();
             LOG_INFO(Render_Vulkan, "Frame dump done: {} images, {}, {} MiB in {}{}", images,
                      job.tags, written_bytes >> 20, directory.string(),
-                     job.truncated ? fmt::format(" (stopped at the {} GiB cap)", SIZE_CAP >> 30)
+                     job.truncated ? fmt::format(" (stopped at the {} GiB cap)", SizeCap() >> 30)
                                    : "");
             if (const u64 id = schedule.CaptureId(); id != 0) {
                 VideoCore::Nx2Debug::FinishCapture(id, {});
