@@ -40,6 +40,24 @@ TEST_CASE("Spatial cutscene replacement decodes sRGB into float without temporal
     }
 }
 
+TEST_CASE("DLSS dynamic resolution keeps a valid mode and checks both dimensions",
+          "[dlss_contract]") {
+    constexpr std::array modes{
+        VideoCommon::DlssModeRange{},
+        VideoCommon::DlssModeRange{3, {880, 490}, {1024, 576}},
+        VideoCommon::DlssModeRange{2, {768, 432}, {920, 520}},
+        VideoCommon::DlssModeRange{1, {640, 360}, {800, 460}},
+    };
+    using VideoCommon::SelectDlssMode;
+    REQUIRE(SelectDlssMode(modes, {888, 500}, 0, 2) == 2);
+    REQUIRE(SelectDlssMode(modes, {900, 510}, 2, 3) == 2);
+    REQUIRE(SelectDlssMode(modes, {900, 540}, 2, 2) == 3);
+    REQUIRE(SelectDlssMode(modes, {780, 440}, 3, 3) == 2);
+    REQUIRE(SelectDlssMode(modes, {900, 577}, 3, 3) == 0);
+    REQUIRE(SelectDlssMode(modes, {1025, 500}, 3, 3) == 0);
+    REQUIRE(SelectDlssMode(modes, {780, 440}, 0, 2) == 2);
+}
+
 TEST_CASE("DLSS recording restores inputs before each evaluation failure returns", "[dlss_contract]") {
     using EvaluationResult = VideoCommon::DlssEvaluationResult;
     for (const auto failure : {EvaluationResult::Succeeded, EvaluationResult::OptionsFailed,

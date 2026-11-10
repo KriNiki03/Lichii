@@ -69,7 +69,7 @@ void DrainBack() {
 // without draining the split, if no GPU work ever wrote the word's page (then no cache holds a
 // newer word than guest memory). It counts as a host sync for later GPU-written command lists,
 // as the drain did. Equal and mask acquires always drain.
-bool GequalMetWithoutDrain(DmaPusher& dma_pusher, GPUVAddr address, u32 value) {
+[[maybe_unused]] bool GequalMetWithoutDrain(DmaPusher& dma_pusher, GPUVAddr address, u32 value) {
     static const bool enabled = [] {
         const char* setting = std::getenv("EDEN_NX2_ACQUIRE_PRECHECK");
         return setting != nullptr && setting[0] != '0';

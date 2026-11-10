@@ -733,6 +733,8 @@ bool KeplerCompute::ProcessGameDlss(u64 program_id, u64 native_key) {
     const bool replacement = dlss_chain.failure != VideoCore::GameDlssReason::None ||
                              GameDlssBlocker() != VideoCore::GameDlssReason::None;
     if (dlss_chain.output_pass) {
+        TraceDuskDlss(dusk_dlss_trace_output, "output hook selected immediate replacement={}",
+                      replacement);
         return replacement && FinishDlssEvaluation();
     }
     return dlss_chain.failure != VideoCore::GameDlssReason::None &&
@@ -959,6 +961,9 @@ bool KeplerCompute::FinishDlssEvaluation(bool output_dispatched) {
         }
     }
     UpdateGameDlssStatus(complete, blocker);
+    TraceDuskDlss(dusk_dlss_trace_output,
+                  "evaluation complete={} rejected={} blocker='{}' showing native={}", complete,
+                  dlss_chain.rejected, VideoCore::GameDlssReasonText(blocker), native);
     if (native) {
         dlss_motion_vectors.reset();
         dlss_depth.reset();
@@ -1194,7 +1199,7 @@ void KeplerCompute::TraceDlssContract(u64 native_key, bool warn_unvalidated) {
 }
 
 void KeplerCompute::ReportDuskTemporalResult(const char* failure) {
-    const std::string_view outcome = failure ? failure : "FSR 3.1 and output handoff recorded";
+    const std::string_view outcome = failure ? failure : "temporal upscale and output handoff recorded";
     if (dusk_dlss_trace_output || dusk_dlss_results.insert(outcome).second) {
         TraceDuskDlss(true, "temporal result: {}", outcome);
     }
@@ -1302,6 +1307,11 @@ bool KeplerCompute::TryFireEmblemUpscale(bool allow_history) {
     const bool trace = dusk_dlss_trace_output;
     const auto& cbuf = launch_description.const_buffer_config[0];
     const GPUVAddr address = (GPUVAddr{cbuf.address_high} << 32) | cbuf.address_low;
+    TraceDuskDlss(trace, "replacement called: jitter={} motion={} depth={} explicit history={} "
+                        "cb0={:#x} size={:#x} input={:#x} output={:#x} last column={:#x} last row={:#x}",
+                  jitter.has_value(), motion.has_value(), depth.has_value(), use_history, address,
+                  cbuf.size.Value(), OutputColorInputOffset, OutputColorOffset, RenderLastColumnOffset,
+                  RenderLastRowOffset);
     if (!dlss_chain.render_region && (!jitter || (use_history && (!motion || !depth)))) {
         TraceDuskDlss(trace, "replacement rejected: {}",
                       !jitter ? "missing jitter" : "explicit temporal mode requires motion and depth");

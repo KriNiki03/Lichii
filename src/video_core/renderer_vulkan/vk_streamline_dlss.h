@@ -10,7 +10,12 @@
 #include <atomic>
 
 #include "common/common_types.h"
+#include "video_core/dlss_evaluation.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
+
+namespace sl {
+struct DLSSOptions;
+}
 
 namespace Vulkan {
 
@@ -26,6 +31,8 @@ public:
         VkFormat format;
         VkImageSubresourceRange range;     ///< The view's level and layer, with the view's aspect.
         VkImageAspectFlags barrier_aspect; ///< Every aspect of the image's format.
+        VkExtent2D extent;                 ///< Backing image dimensions, including unused pixels.
+        VkImageUsageFlags usage;
     };
 
     struct Inputs {
@@ -39,6 +46,7 @@ public:
         /// Turns a motion vector into render pixels (the render size for UV offsets).
         std::array<f32, 2> motion_vector_scale;
         bool reset;
+        bool dynamic_resolution;
     };
 
     /// Throws vk::Exception when Streamline has no DLSS for this device.
@@ -49,6 +57,10 @@ public:
     /// Records one evaluation into the output image (RGBA16F at the upscale size, GENERAL
     /// layout). Returns false when DLSS can't run, so the caller can fall back to FSR 3.1.
     bool Upscale(const Inputs& inputs);
+
+    [[nodiscard]] bool Failed() const noexcept {
+        return failed.load();
+    }
 
     [[nodiscard]] VkImage OutputImage() const noexcept {
         return *output_image;
@@ -63,6 +75,7 @@ public:
 
 private:
     void CreateOutput(VkExtent2D upscale_size);
+    void QueryModeRanges(sl::DLSSOptions options);
 
     const Device& device;
     Scheduler& scheduler;
@@ -70,6 +83,10 @@ private:
     void* set_options{}; ///< slDLSSSetOptions
     VkExtent2D render_extent{};
     VkExtent2D upscale_extent{};
+    VkExtent2D mode_query_extent{};
+    std::array<VideoCommon::DlssModeRange, 5> mode_ranges{};
+    u32 active_mode{};
+    bool logged_unsupported_extent{};
     u32 frame_index{};
     vk::Image output_image;
     vk::ImageView output_view;

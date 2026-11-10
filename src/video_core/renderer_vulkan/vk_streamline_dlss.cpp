@@ -6,6 +6,7 @@
 #include <array>
 #include <cstdlib>
 #include <string_view>
+#include <utility>
 
 #include "common/logging.h"
 #include "video_core/dlss_evaluation.h"
@@ -46,6 +47,10 @@ sl::DLSSMode ModeFor(VkExtent2D render, VkExtent2D upscale) {
         return sl::DLSSMode::eMaxPerformance;
     }
     return sl::DLSSMode::eUltraPerformance;
+}
+
+bool SameExtent(VkExtent2D a, VkExtent2D b) {
+    return a.width == b.width && a.height == b.height;
 }
 
 // Preset K for every mode: NVIDIA's defaults for Performance/Ultra Performance (M, L) draw thin
@@ -105,6 +110,16 @@ sl::Resource Resource(VkImage image, VkImageView view, VkFormat format, VkImageL
     return resource;
 }
 
+sl::SubresourceRange StreamlineRange(const VkImageSubresourceRange& range) {
+    sl::SubresourceRange result{};
+    result.aspectMask = range.aspectMask;
+    result.baseMipLevel = range.baseMipLevel;
+    result.levelCount = range.levelCount;
+    result.baseArrayLayer = range.baseArrayLayer;
+    result.layerCount = range.layerCount;
+    return result;
+}
+
 } // Anonymous namespace
 
 StreamlineDlssUpscaler::StreamlineDlssUpscaler(const Device& device_, Scheduler& scheduler_,
@@ -155,7 +170,7 @@ void StreamlineDlssUpscaler::CreateOutput(VkExtent2D upscale_size) {
     if (output_image) {
         scheduler.Finish(); // the old output may still be in use
     }
-    output_image = memory_allocator.CreateImage(VkImageCreateInfo{
+    auto image = memory_allocator.CreateImage(VkImageCreateInfo{
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
         .pNext = nullptr,
         .flags = 0,
@@ -176,7 +191,7 @@ void StreamlineDlssUpscaler::CreateOutput(VkExtent2D upscale_size) {
         .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
         .pNext = nullptr,
         .flags = 0,
-        .image = *output_image,
+        .image = *image,
         .viewType = VK_IMAGE_VIEW_TYPE_2D,
         .format = OUTPUT_FORMAT,
         .components{},
@@ -188,15 +203,18 @@ void StreamlineDlssUpscaler::CreateOutput(VkExtent2D upscale_size) {
             .layerCount = 1,
         },
     });
+    output_image = std::move(image);
     scheduler.RequestOutsideRenderPassOperationContext();
     scheduler.Record([image = *output_image](vk::CommandBuffer cmdbuf) {
         cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                                   VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
                                VkImageMemoryBarrier{
                                    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
                                    .pNext = nullptr,
                                    .srcAccessMask = 0,
-                                   .dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+                                   .dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT |
+                                                    VK_ACCESS_TRANSFER_WRITE_BIT,
                                    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
                                    .newLayout = VK_IMAGE_LAYOUT_GENERAL,
                                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
@@ -213,27 +231,50 @@ void StreamlineDlssUpscaler::CreateOutput(VkExtent2D upscale_size) {
     });
 }
 
+void StreamlineDlssUpscaler::QueryModeRanges(sl::DLSSOptions options) {
+    // The query shares NGX parameters with evaluation on the scheduler worker.
+    scheduler.WaitWorker();
+    mode_query_extent = {options.outputWidth, options.outputHeight};
+    mode_ranges = {};
+    logged_unsupported_extent = false;
+    void* function{};
+    const auto result = Streamline::GetApi().get_feature_function(
+        sl::kFeatureDLSS, "slDLSSGetOptimalSettings", function);
+    if (result != sl::Result::eOk || !function) {
+        LOG_WARNING(Render_Vulkan, "Streamline has no slDLSSGetOptimalSettings (result {})",
+                    static_cast<int>(result));
+        return;
+    }
+    const auto get_settings = reinterpret_cast<PFun_slDLSSGetOptimalSettings*>(function);
+    constexpr std::array modes{sl::DLSSMode::eDLAA, sl::DLSSMode::eMaxQuality,
+                               sl::DLSSMode::eBalanced, sl::DLSSMode::eMaxPerformance,
+                               sl::DLSSMode::eUltraPerformance};
+    for (size_t i = 0; i < modes.size(); ++i) {
+        options.mode = modes[i];
+        sl::DLSSOptimalSettings settings{};
+        if (const auto status = get_settings(options, settings); status != sl::Result::eOk) {
+            LOG_DEBUG(Render_Vulkan, "Streamline mode {} query for {}x{} returned {}",
+                      static_cast<int>(options.mode), options.outputWidth, options.outputHeight,
+                      static_cast<int>(status));
+            continue;
+        }
+        // A mode without a dynamic range supports its optimal size.
+        mode_ranges[i] = {
+            .mode = static_cast<u32>(options.mode),
+            .min = {settings.renderWidthMin ? settings.renderWidthMin : settings.optimalRenderWidth,
+                    settings.renderHeightMin ? settings.renderHeightMin : settings.optimalRenderHeight},
+            .max = {settings.renderWidthMax ? settings.renderWidthMax : settings.optimalRenderWidth,
+                    settings.renderHeightMax ? settings.renderHeightMax : settings.optimalRenderHeight},
+        };
+    }
+}
+
 bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
-    if (failed) {
+    if (Failed()) {
         return false;
     }
-    bool reset = in.reset;
-    bool options_changed = false;
-    if (!output_image || in.render_size.width != render_extent.width ||
-        in.render_size.height != render_extent.height ||
-        in.upscale_size.width != upscale_extent.width ||
-        in.upscale_size.height != upscale_extent.height) {
-        CreateOutput(in.upscale_size);
-        render_extent = in.render_size;
-        upscale_extent = in.upscale_size;
-        options_changed = true;
-        reset = true;
-    }
 
-    // The game's own setup (Fortune's Weave: render-size motion vectors, reversed depth). Its
-    // colour is linear and goes above 1 with no exposure passed, so by default DLSS gets the HDR
-    // path with its own auto exposure. EDEN_NX2_DLSS_HDR=0 / EDEN_NX2_DLSS_AUTO_EXPOSURE=0 turn
-    // those off.
+    // The games supply linear HDR colour and reversed depth, with no exposure texture.
     sl::DLSSOptions options{};
     options.mode = ModeFor(in.render_size, in.upscale_size);
     options.outputWidth = in.upscale_size.width;
@@ -248,12 +289,42 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
     options.performancePreset = preset;
     options.ultraPerformancePreset = preset;
     options.ultraQualityPreset = preset;
-    if (options_changed) {
-        LOG_INFO(Render_Vulkan, "NVIDIA DLSS (Streamline): {}x{} -> {}x{}, mode {}, preset {}",
-                 in.render_size.width, in.render_size.height, in.upscale_size.width,
-                 in.upscale_size.height, static_cast<int>(options.mode),
-                 static_cast<int>(preset));
+
+    if (in.dynamic_resolution) {
+        if (!SameExtent(in.upscale_size, mode_query_extent)) {
+            QueryModeRanges(options);
+            if (Failed()) {
+                return false;
+            }
+        }
+        const u32 mode = VideoCommon::SelectDlssMode(
+            mode_ranges, {in.render_size.width, in.render_size.height},
+            SameExtent(in.upscale_size, upscale_extent) ? active_mode : 0,
+            static_cast<u32>(options.mode));
+        if (!mode) {
+            if (!logged_unsupported_extent) {
+                logged_unsupported_extent = true;
+                LOG_WARNING(Render_Vulkan,
+                            "No Streamline DLSS mode supports {}x{} -> {}x{}; using FSR 3.1",
+                            in.render_size.width, in.render_size.height, in.upscale_size.width,
+                            in.upscale_size.height);
+            }
+            return false;
+        }
+        options.mode = static_cast<sl::DLSSMode>(mode);
     }
+    const bool output_changed = !output_image || !SameExtent(in.upscale_size, upscale_extent);
+    const bool render_changed = !SameExtent(in.render_size, render_extent);
+    // A supported render-size change within the current mode can reuse DLSS history.
+    const bool options_changed = output_changed || active_mode != static_cast<u32>(options.mode) ||
+                                 (!in.dynamic_resolution && render_changed);
+    const bool reset = in.reset || options_changed;
+    if (output_changed) {
+        CreateOutput(in.upscale_size);
+    }
+    render_extent = in.render_size;
+    upscale_extent = in.upscale_size;
+    active_mode = static_cast<u32>(options.mode);
 
     scheduler.RequestOutsideRenderPassOperationContext();
     scheduler.Record([this, in, reset, options, options_changed, index = frame_index++,
@@ -287,7 +358,8 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
             };
             cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                                    VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
-                                   barrier(VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                                   barrier(VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                                               VK_ACCESS_TRANSFER_WRITE_BIT,
                                            VK_ACCESS_TRANSFER_WRITE_BIT));
             cmdbuf.ClearColorImage(output_image_handle, VK_IMAGE_LAYOUT_GENERAL,
                                    VkClearColorValue{}, range);
@@ -295,6 +367,10 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
                 barrier(VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT));
         };
+        if (Failed()) {
+            clear_output();
+            return;
+        }
         sl::FrameToken* frame{};
 
         constexpr VkAccessFlags WRITES =
@@ -340,17 +416,25 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
         constants.motionVectorsJittered = sl::eFalse;
 
         sl::Resource color = Resource(in.color.image, in.color.view, in.color.format,
-                                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, in.render_size,
-                                      VK_IMAGE_USAGE_SAMPLED_BIT);
+                                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, in.color.extent,
+                                      in.color.usage);
         sl::Resource depth = Resource(in.depth.image, in.depth.view, in.depth.format,
-                                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, in.render_size,
-                                      VK_IMAGE_USAGE_SAMPLED_BIT);
+                                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, in.depth.extent,
+                                      in.depth.usage);
         sl::Resource motion = Resource(in.motion_vectors.image, in.motion_vectors.view,
                                        in.motion_vectors.format,
-                                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, in.render_size,
-                                       VK_IMAGE_USAGE_SAMPLED_BIT);
+                                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                       in.motion_vectors.extent, in.motion_vectors.usage);
         sl::Resource output = Resource(output_image_handle, output_view_handle, OUTPUT_FORMAT,
                                        VK_IMAGE_LAYOUT_GENERAL, in.upscale_size, OUTPUT_USAGE);
+        // Describe the exact view ranges to NGX. For D24S8 the Vulkan barriers still cover
+        // both aspects, while NGX samples only depth.
+        auto color_range = StreamlineRange(in.color.range);
+        auto depth_range = StreamlineRange(in.depth.range);
+        auto motion_range = StreamlineRange(in.motion_vectors.range);
+        color.next = &color_range;
+        depth.next = &depth_range;
+        motion.next = &motion_range;
         const sl::Extent render_area{0, 0, in.render_size.width, in.render_size.height};
         const sl::Extent output_area{0, 0, in.upscale_size.width, in.upscale_size.height};
         // Local tags: everything stays put until the evaluation is recorded.
@@ -375,7 +459,7 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
         const VkMemoryBarrier output_written{
             .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
             .pNext = nullptr,
-            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
             .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
         };
         sl::Result api_result = sl::Result::eOk;
@@ -406,17 +490,24 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
                 return api_result == sl::Result::eOk;
             },
             [&] {
-                cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                                           VK_PIPELINE_STAGE_TRANSFER_BIT,
                                        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, output_written, {},
                                        to_general);
             });
-        if (result != VideoCommon::DlssEvaluationResult::Succeeded && !failed.exchange(true)) {
+        if (result != VideoCommon::DlssEvaluationResult::Succeeded) {
+            failed = true;
+            constexpr std::array stages{"success", "slDLSSSetOptions", "slGetNewFrameToken",
+                                        "slSetConstants", "slEvaluateFeature"};
             LOG_ERROR(Render_Vulkan,
                       "NVIDIA DLSS recording failed at stage {} (Streamline result {}); using FSR 3.1",
-                      static_cast<int>(result), static_cast<int>(api_result));
-        }
-        if (result != VideoCommon::DlssEvaluationResult::Succeeded) {
+                      stages[static_cast<size_t>(result)], static_cast<int>(api_result));
             clear_output();
+        } else if (options_changed) {
+            LOG_INFO(Render_Vulkan, "NVIDIA DLSS (Streamline): {}x{} -> {}x{}, mode {}, preset {}",
+                     in.render_size.width, in.render_size.height, in.upscale_size.width,
+                     in.upscale_size.height, static_cast<int>(options.mode),
+                     static_cast<int>(options.dlaaPreset));
         }
     });
     // DLSS binds its own pipelines and descriptors on the command buffer.

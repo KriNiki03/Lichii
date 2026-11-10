@@ -22,6 +22,14 @@ Resolution scaling scales the render extent and jitter together. History resets 
 changes, first use and evaluation gaps longer than 250 ms. An explicit game camera-cut
 reset is not yet extracted.
 
+Duskbloods uses the active render and output rectangles from the game, with B10G11R11 scene
+colour, R16G16 motion, D24S8 depth, and the current jitter and reset flag. NVIDIA DLSS uses
+the active render size to select a supported mode and keeps the mode while both dimensions fit.
+The output image is recreated when the active output size changes. Output size changes, mode
+changes and backend switches reset DLSS history. Render size changes within the current mode's
+range keep history unless the game requests a reset. An extent outside the supported DLSS modes
+uses FSR 3.1 for that frame. Invalid contracts leave the native output intact.
+
 Fast Fusion's shaders still execute natively. Its captured shader identities are known,
 but motion scale/direction, jitter units, depth convention, reset and resource roles have
 not been proven for this LLE path. The RGBA16F menu/DLAA path also requires alpha handling
@@ -44,7 +52,8 @@ and makes later evaluations fall back; it does not wait for the scheduler worker
 
 `EDEN_NX2_DLSS_REPLACEMENT=fsr` selects temporal replacement and forces FSR for comparison.
 `dlss` selects temporal replacement with NVIDIA preferred when enabled and available.
-`native` preserves the guest evaluation. With no override, Fire Emblem uses spatial de-jitter.
+`native` preserves the guest evaluation. With no override, Duskbloods prefers NVIDIA DLSS
+when enabled and available, and Fire Emblem uses spatial de-jitter.
 The old `EDEN_NX2_DLSS_STANDIN` variable is not read. The internal `standin` backend override
 does not select Fire Emblem's intercepted dispatch. The RCAS sharpness setting controls FSR
 and fallback sharpening. NVIDIA model-selection overrides
