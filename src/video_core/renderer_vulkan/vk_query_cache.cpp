@@ -5,7 +5,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <cstddef>
-#include <limits>
 #include <map>
 #include <memory>
 #include <span>
@@ -107,6 +106,20 @@ public:
         return index;
     }
 
+    void SetResolveBase(size_t batch_slot, size_t bank_slot) {
+        resolve_first_slot = batch_slot;
+        resolve_first_bank_slot = bank_slot;
+    }
+
+    size_t GetResolveBase() const {
+        return resolve_first_slot;
+    }
+
+    size_t GetResolveSlot(size_t bank_slot) const {
+        ASSERT(bank_slot >= resolve_first_bank_slot);
+        return resolve_first_slot + (bank_slot - resolve_first_bank_slot);
+    }
+
     const std::array<u64, BANK_SIZE>& GetResults() const {
         return host_results;
     }
@@ -120,6 +133,8 @@ private:
     vk::QueryPool query_pool;
     std::array<u64, BANK_SIZE> host_results;
     u64 last_used_tick{};
+    size_t resolve_first_slot{};
+    size_t resolve_first_bank_slot{};
 };
 
 using BaseStreamer = VideoCommon::SimpleStreamer<VideoCommon::HostQueryBase>;
@@ -205,9 +220,9 @@ public:
             accumulation_value = 0;
         });
         rasterizer->SyncOperation(std::move(func));
-        accumulation_since_last_sync = false;
-        first_accumulation_checkpoint = (std::min)(first_accumulation_checkpoint, num_slots_used);
-        last_accumulation_checkpoint = (std::max)(last_accumulation_checkpoint, num_slots_used);
+        if (accumulation_checkpoints.empty() || accumulation_checkpoints.back() != num_slots_used) {
+            accumulation_checkpoints.push_back(num_slots_used);
+        }
     }
 
     // Called at each submission. The running query carries the count across it: a guest's
@@ -241,11 +256,7 @@ public:
             return;
         }
 
-        for (size_t i = 0; i < sync_values_stash.size(); i++) {
-            runtime.template SyncValues<HostSyncValues>(sync_values_stash[i],
-                                                        *buffers[resolve_buffers[i]]);
-        }
-
+        runtime.template SyncValues<HostSyncValues>(sync_values_stash, *buffers[scan_buffer_index]);
         sync_values_stash.clear();
     }
 
@@ -262,23 +273,49 @@ public:
             return;
         }
         sync_values_stash.clear();
-        sync_values_stash.emplace_back();
-        std::vector<HostSyncValues>* sync_values = &sync_values_stash.back();
-        sync_values->reserve(num_slots_used);
-        ::Common::unordered_map<size_t, std::pair<size_t, size_t>> offsets;
-        resolve_buffers.clear();
-        size_t resolve_buffer_index = ObtainBuffer<true>(num_slots_used);
-        resolve_buffers.push_back(resolve_buffer_index);
-        size_t base_offset = 0;
+        sync_values_stash.reserve(pending_sync.size());
+        const size_t resolve_buffer_index = ObtainBuffer<true>(num_slots_used);
+        scan_buffer_index = ObtainBuffer<false>(num_slots_used);
+
+        for (auto q : pending_sync) {
+            auto* query = GetQuery(q);
+            if (True(query->flags & VideoCommon::QueryFlagBits::IsRewritten)) {
+                continue;
+            }
+            if (True(query->flags & VideoCommon::QueryFlagBits::IsInvalidated)) {
+                continue;
+            }
+            const auto& bank = bank_pool.GetBank(query->start_bank_id);
+            const size_t last_slot = bank.GetResolveSlot(query->start_slot) + query->size_slots - 1;
+            query->flags |= VideoCommon::QueryFlagBits::IsHostSynced;
+            sync_values_stash.emplace_back(HostSyncValues{
+                .address = query->guest_address,
+                .size = SamplesQueryBank::QUERY_SIZE,
+                .offset = last_slot * SamplesQueryBank::QUERY_SIZE,
+            });
+        }
+
+        // Include the unreported tail of the live query in the carry to the next batch.
+        if (current_query) {
+            pending_sync.push_back(current_query_id);
+        }
+
+        // Keep resolve indices in reservation order, including gaps left by unreported slots.
+        // The scan uses the same indices for its reset checkpoints.
+        const VkBuffer resolve_buffer = *buffers[resolve_buffer_index];
+        size_t end_offset = 0;
 
         ApplyBanksWideOp<true>(pending_sync, [&](SamplesQueryBank* bank, size_t start,
                                                  size_t amount) {
-            size_t bank_id = bank->GetIndex();
-            auto& resolve_buffer = buffers[resolve_buffer_index];
-            VkQueryPool query_pool = bank->GetInnerPool();
+            const size_t offset = bank->GetResolveSlot(start) * SamplesQueryBank::QUERY_SIZE;
+            const size_t gap_size = offset - end_offset;
+            const VkQueryPool query_pool = bank->GetInnerPool();
             scheduler.RequestOutsideRenderPassOperationContext();
-            scheduler.Record([start, amount, base_offset, query_pool,
-                              buffer = *resolve_buffer](vk::CommandBuffer cmdbuf) {
+            scheduler.Record([start, amount, offset, gap_size, query_pool,
+                              resolve_buffer](vk::CommandBuffer cmdbuf) {
+                if (gap_size != 0) {
+                    cmdbuf.FillBuffer(resolve_buffer, offset - gap_size, gap_size, 0);
+                }
                 const VkBufferMemoryBarrier copy_query_pool_barrier{
                     .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
                     .pNext = nullptr,
@@ -286,77 +323,36 @@ public:
                     .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
                     .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                     .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                    .buffer = buffer,
-                    .offset = base_offset,
+                    .buffer = resolve_buffer,
+                    .offset = offset,
                     .size = amount * SamplesQueryBank::QUERY_SIZE,
                 };
 
                 cmdbuf.CopyQueryPoolResults(
-                    query_pool, static_cast<u32>(start), static_cast<u32>(amount), buffer,
-                    static_cast<u32>(base_offset), SamplesQueryBank::QUERY_SIZE,
+                    query_pool, static_cast<u32>(start), static_cast<u32>(amount), resolve_buffer,
+                    offset, SamplesQueryBank::QUERY_SIZE,
                     VK_QUERY_RESULT_WAIT_BIT | VK_QUERY_RESULT_64_BIT);
                 cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
                                        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, copy_query_pool_barrier);
             });
-            offsets[bank_id] = {start, base_offset};
-            base_offset += amount * SamplesQueryBank::QUERY_SIZE;
+            end_offset = offset + amount * SamplesQueryBank::QUERY_SIZE;
         });
 
-        // Convert queries
-        bool has_multi_queries = false;
-        for (auto q : pending_sync) {
-            auto* query = GetQuery(q);
-            size_t sync_value_slot = 0;
-            if (True(query->flags & VideoCommon::QueryFlagBits::IsRewritten)) {
-                continue;
-            }
-            if (True(query->flags & VideoCommon::QueryFlagBits::IsInvalidated)) {
-                continue;
-            }
-            if (accumulation_since_last_sync || query->size_slots > 1) {
-                if (!has_multi_queries) {
-                    has_multi_queries = true;
-                    sync_values_stash.emplace_back();
-                }
-                sync_value_slot = 1;
-            }
-            query->flags |= VideoCommon::QueryFlagBits::IsHostSynced;
-            auto loc_data = offsets[query->start_bank_id];
-            sync_values_stash[sync_value_slot].emplace_back(HostSyncValues{
-                .address = query->guest_address,
-                .size = SamplesQueryBank::QUERY_SIZE,
-                .offset =
-                    loc_data.second + (query->start_slot - loc_data.first + query->size_slots - 1) *
-                                          SamplesQueryBank::QUERY_SIZE,
+        const size_t scan_size = num_slots_used * SamplesQueryBank::QUERY_SIZE;
+        if (end_offset < scan_size) {
+            scheduler.Record([resolve_buffer, end_offset, scan_size](vk::CommandBuffer cmdbuf) {
+                cmdbuf.FillBuffer(resolve_buffer, end_offset, scan_size - end_offset, 0);
             });
         }
-
-        if (has_multi_queries) {
-            const size_t min_accumulation_limit =
-                (std::min)(first_accumulation_checkpoint, num_slots_used);
-            const size_t max_accumulation_limit =
-                (std::max)(last_accumulation_checkpoint, num_slots_used);
-            const size_t intermediary_buffer_index = ObtainBuffer<false>(num_slots_used);
-            resolve_buffers.push_back(intermediary_buffer_index);
-            queries_prefix_scan_pass->Run(*accumulation_buffer, *buffers[intermediary_buffer_index],
-                                          *buffers[resolve_buffer_index], num_slots_used,
-                                          min_accumulation_limit, max_accumulation_limit);
-
-        } else {
-            scheduler.RequestOutsideRenderPassOperationContext();
-            scheduler.Record([buffer = *accumulation_buffer](vk::CommandBuffer cmdbuf) {
-                cmdbuf.FillBuffer(buffer, 0, 8, 0);
-            });
-        }
+        queries_prefix_scan_pass->Run(*accumulation_buffer, *buffers[scan_buffer_index],
+                                      resolve_buffer, num_slots_used, accumulation_checkpoints);
 
         ReplicateCurrentQueryIfNeeded();
         std::function<void()> func([this] { amend_value = accumulation_value; });
         rasterizer->SyncOperation(std::move(func));
         AbandonCurrentQuery();
         num_slots_used = 0;
-        first_accumulation_checkpoint = (std::numeric_limits<size_t>::max)();
-        last_accumulation_checkpoint = 0;
-        accumulation_since_last_sync = has_multi_queries;
+        accumulation_checkpoints.clear();
         pending_sync.clear();
     }
 
@@ -454,23 +450,26 @@ private:
     TextureCache& texture_cache;
     template <bool is_ordered, typename Func>
     void ApplyBanksWideOp(std::vector<size_t>& queries, Func&& func) {
-        std::conditional_t<is_ordered, std::map<size_t, std::pair<size_t, size_t>>,
-                           ::Common::unordered_map<size_t, std::pair<size_t, size_t>>>
+        struct BankRange {
+            SamplesQueryBank* bank;
+            size_t start;
+            size_t end;
+        };
+        std::conditional_t<is_ordered, std::map<size_t, BankRange>,
+                           ::Common::unordered_map<size_t, BankRange>>
             indexer;
         for (auto q : queries) {
             auto* query = GetQuery(q);
             ApplyBankOp(query, [&indexer](SamplesQueryBank* bank, size_t start, size_t amount) {
-                auto id_ = bank->GetIndex();
-                auto pair = indexer.try_emplace(id_, (std::numeric_limits<size_t>::max)(),
-                                                (std::numeric_limits<size_t>::min)());
-                auto& current_pair = pair.first->second;
-                current_pair.first = (std::min)(current_pair.first, start);
-                current_pair.second = (std::max)(current_pair.second, amount + start);
+                const size_t key = is_ordered ? bank->GetResolveBase() : bank->GetIndex();
+                auto& range =
+                    indexer.try_emplace(key, BankRange{bank, start, start + amount}).first->second;
+                range.start = (std::min)(range.start, start);
+                range.end = (std::max)(range.end, start + amount);
             });
         }
-        for (auto& cont : indexer) {
-            func(&bank_pool.GetBank(cont.first), cont.second.first,
-                 cont.second.second - cont.second.first);
+        for (const auto& [key, range] : indexer) {
+            func(range.bank, range.start, range.end - range.start);
         }
     }
 
@@ -497,6 +496,9 @@ private:
 
     void ReserveHostQuery() {
         size_t new_slot = ReserveBankSlot();
+        if (num_slots_used == 0 || new_slot == 0) {
+            current_bank->SetResolveBase(num_slots_used, new_slot);
+        }
         current_bank->AddReference(1);
         num_slots_used++;
         if (current_query) {
@@ -612,8 +614,8 @@ private:
     std::array<size_t, 32> resolve_table{};
     std::array<size_t, 32> intermediary_table{};
     vk::Buffer accumulation_buffer;
-    std::deque<std::vector<HostSyncValues>> sync_values_stash;
-    std::vector<size_t> resolve_buffers;
+    std::vector<HostSyncValues> sync_values_stash;
+    size_t scan_buffer_index{};
 
     // syncing queue
     std::vector<size_t> pending_sync;
@@ -629,9 +631,8 @@ private:
     VkQueryPool current_query_pool;
     size_t current_query_id;
     size_t num_slots_used{};
-    size_t first_accumulation_checkpoint{};
-    size_t last_accumulation_checkpoint{};
-    bool accumulation_since_last_sync{};
+    // Each checkpoint is the first reservation slot after a counter reset.
+    std::vector<size_t> accumulation_checkpoints;
     VideoCommon::HostQueryBase* current_query;
     bool has_started{};
     u64 bank_bound_resets{}; ///< Counts CloseCounter dropped once a query outgrew a bank.

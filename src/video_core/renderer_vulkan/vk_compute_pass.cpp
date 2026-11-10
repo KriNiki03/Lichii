@@ -239,8 +239,8 @@ struct BcEncoderPushConstants {
 };
 
 struct QueriesPrefixScanPushConstants {
-    u32 min_accumulation_base;
-    u32 max_accumulation_base;
+    u32 reset_accumulation;
+    u32 clear_accumulation;
     u32 accumulation_limit;
     u32 buffer_offset;
 };
@@ -556,7 +556,7 @@ QueriesPrefixScanPass::QueriesPrefixScanPass(
 
 void QueriesPrefixScanPass::Run(VkBuffer accumulation_buffer, VkBuffer dst_buffer,
                                 VkBuffer src_buffer, size_t number_of_sums,
-                                size_t min_accumulation_limit, size_t max_accumulation_limit) {
+                                std::span<const size_t> reset_slots) {
     constexpr VkAccessFlags BASE_DST_ACCESS = VK_ACCESS_SHADER_READ_BIT |
                                               VK_ACCESS_TRANSFER_READ_BIT |
                                               VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT |
@@ -565,27 +565,31 @@ void QueriesPrefixScanPass::Run(VkBuffer accumulation_buffer, VkBuffer dst_buffe
                                               VK_ACCESS_UNIFORM_READ_BIT;
     const VkAccessFlags conditional_access =
         device.IsExtConditionalRendering() ? VK_ACCESS_CONDITIONAL_RENDERING_READ_BIT_EXT : 0;
-    size_t current_runs = number_of_sums;
-    size_t offset = 0;
-    while (current_runs != 0) {
-        static constexpr size_t DISPATCH_SIZE = 2048U;
-        size_t runs_to_do = std::min<size_t>(current_runs, DISPATCH_SIZE);
-        current_runs -= runs_to_do;
+    auto next_reset = reset_slots.begin();
+    for (size_t offset = 0; offset < number_of_sums;) {
+        static constexpr size_t DISPATCH_SIZE = 1024;
+        const bool reset_accumulation = next_reset != reset_slots.end() && *next_reset == offset;
+        if (reset_accumulation) {
+            ++next_reset;
+        }
+        const size_t segment_end = next_reset == reset_slots.end() ? number_of_sums : *next_reset;
+        const size_t runs_to_do = std::min(segment_end - offset, DISPATCH_SIZE);
+        const size_t used_offset = offset;
+        offset += runs_to_do;
+        // A reset after the final slot still discards the carry to the next batch.
+        const bool clear_accumulation = offset == number_of_sums && next_reset != reset_slots.end();
         compute_pass_descriptor_queue.Acquire(scheduler, 3);
         compute_pass_descriptor_queue.AddBuffer(src_buffer, 0, number_of_sums * sizeof(u64));
         compute_pass_descriptor_queue.AddBuffer(dst_buffer, 0, number_of_sums * sizeof(u64));
         compute_pass_descriptor_queue.AddBuffer(accumulation_buffer, 0, sizeof(u64));
         const void* const descriptor_data{compute_pass_descriptor_queue.UpdateData()};
-        size_t used_offset = offset;
-        offset += runs_to_do;
-
         scheduler.RequestOutsideRenderPassOperationContext();
-        scheduler.Record([this, descriptor_data, min_accumulation_limit, max_accumulation_limit,
+        scheduler.Record([this, descriptor_data, reset_accumulation, clear_accumulation,
                           runs_to_do, used_offset, conditional_access](vk::CommandBuffer cmdbuf) {
             static constexpr VkMemoryBarrier read_barrier{
                 .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
                 .pNext = nullptr,
-                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
                 .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
             };
             const VkMemoryBarrier write_barrier{
@@ -595,22 +599,23 @@ void QueriesPrefixScanPass::Run(VkBuffer accumulation_buffer, VkBuffer dst_buffe
                 .dstAccessMask = BASE_DST_ACCESS | conditional_access,
             };
             const QueriesPrefixScanPushConstants uniforms{
-                .min_accumulation_base = static_cast<u32>(min_accumulation_limit),
-                .max_accumulation_base = static_cast<u32>(max_accumulation_limit),
+                .reset_accumulation = reset_accumulation ? 1U : 0U,
+                .clear_accumulation = clear_accumulation ? 1U : 0U,
                 .accumulation_limit = static_cast<u32>(runs_to_do - 1),
                 .buffer_offset = static_cast<u32>(used_offset),
             };
             const VkDescriptorSet set = descriptor_allocator.Commit();
             device.GetLogical().UpdateDescriptorSet(set, *descriptor_template, descriptor_data);
 
-            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT |
+                                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, read_barrier);
             cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline);
             cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *layout, 0, set, {});
             cmdbuf.PushConstants(*layout, VK_SHADER_STAGE_COMPUTE_BIT, uniforms);
             cmdbuf.Dispatch(1, 1, 1);
             cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                   vk::PIPELINE_STAGE_GRAPHICS_COMPUTE, 0, write_barrier);
+                                   vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, 0, write_barrier);
         });
     }
 }

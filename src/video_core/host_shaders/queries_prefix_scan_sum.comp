@@ -34,14 +34,14 @@
 #endif
 
 BEGIN_PUSH_CONSTANTS
-UNIFORM(0) uint min_accumulation_base;
-UNIFORM(1) uint max_accumulation_base;
+UNIFORM(0) uint reset_accumulation;
+UNIFORM(1) uint clear_accumulation;
 UNIFORM(2) uint accumulation_limit;
 UNIFORM(3) uint buffer_offset;
 END_PUSH_CONSTANTS
 
 #define LOCAL_RESULTS 8
-#define QUERIES_PER_INVOC 2048
+#define QUERIES_PER_INVOC 1024
 
 layout(local_size_x = QUERIES_PER_INVOC / LOCAL_RESULTS) in;
 
@@ -49,7 +49,7 @@ layout(std430, binding = 0) readonly buffer block1 {
     uvec2 input_data[];
 };
 
-layout(std430, binding = 1) coherent buffer block2 {
+layout(std430, binding = 1) writeonly buffer block2 {
     uvec2 output_data[];
 };
 
@@ -57,7 +57,8 @@ layout(std430, binding = 2) coherent buffer block3 {
     uvec2 accumulated_data;
 };
 
-shared uvec2 shared_data[128];
+shared uvec2 shared_data[gl_WorkGroupSize.x];
+shared uvec2 base_value;
 
 // Simple Uint64 add that uses 2 uint variables for GPUs that don't support uint64
 uvec2 AddUint64(uvec2 value_1, uvec2 value_2) {
@@ -83,44 +84,33 @@ uvec2 subgroupInclusiveAddUint64(uvec2 value) {
 // Writes down the results to the output buffer and to the accumulation buffer
 void WriteResults(uvec2 results[LOCAL_RESULTS]) {
     const uint current_id = gl_LocalInvocationID.x;
-    const uvec2 accum = accumulated_data;
-    for (uint i = 0; i < LOCAL_RESULTS; i++) {
-        uvec2 base_data = current_id * LOCAL_RESULTS + i < min_accumulation_base ? accum : uvec2(0, 0);
-        results[i] = AddUint64(results[i], base_data);
-    }
-    for (uint i = 0; i < LOCAL_RESULTS; i++) {
-        output_data[buffer_offset + current_id * LOCAL_RESULTS + i] = results[i];
-    }
-    uint index = accumulation_limit % LOCAL_RESULTS;
-    uint base_id = accumulation_limit / LOCAL_RESULTS;
-    if (min_accumulation_base >= accumulation_limit + 1) {
-        if (current_id == base_id) {
-            accumulated_data = results[index];
-        }
-        return;
-    }
-    // We have that ugly case in which the accumulation data is reset in the middle somewhere.
     barrier();
-    groupMemoryBarrier();
-
-    if (current_id == base_id) {
-        uvec2 reset_value = output_data[max_accumulation_base - 1];
-        // Calculate two complement / negate manually
-        reset_value = AddUint64(uvec2(1,0), ~reset_value);
-        accumulated_data = AddUint64(results[index], reset_value);
+    for (uint i = 0; i < LOCAL_RESULTS; i++) {
+        const uint index = current_id * LOCAL_RESULTS + i;
+        if (index <= accumulation_limit) {
+            const uvec2 sum = AddUint64(results[i], base_value);
+            output_data[buffer_offset + index] = sum;
+            if (index == accumulation_limit) {
+                accumulated_data = clear_accumulation != 0 ? uvec2(0) : sum;
+            }
+        }
     }
 }
 
 void main() {
     const uint subgroup_inv_id = gl_SubgroupInvocationID;
-    const uint subgroup_id = gl_SubgroupID + gl_WorkGroupID.x * gl_NumSubgroups;
+    const uint subgroup_id = gl_SubgroupID;
     const uint last_subgroup_id = subgroupMax(subgroup_inv_id);
     const uint current_id = gl_LocalInvocationID.x;
     const uint total_work = accumulation_limit;
     const uint last_result_id = LOCAL_RESULTS - 1;
+    if (current_id == 0) {
+        base_value = reset_accumulation != 0 ? uvec2(0) : accumulated_data;
+    }
     uvec2 data[LOCAL_RESULTS];
     for (uint i = 0; i < LOCAL_RESULTS; i++) {
-        data[i] = input_data[buffer_offset + current_id * LOCAL_RESULTS + i];
+        const uint index = current_id * LOCAL_RESULTS + i;
+        data[i] = index <= accumulation_limit ? input_data[buffer_offset + index] : uvec2(0);
     }
     uvec2 results[LOCAL_RESULTS];
     results[0] = data[0];
@@ -141,8 +131,8 @@ void main() {
         }
     }
 
-    // if we had less queries than our subgroup, just write down the results.
-    if (total_work <= gl_SubgroupSize * LOCAL_RESULTS) { // This condition is constant per dispatch.
+    // The limit is the last query index. At equality it belongs to the next subgroup.
+    if (total_work < gl_SubgroupSize * LOCAL_RESULTS) {
         WriteResults(results);
         return;
     }
@@ -156,18 +146,12 @@ void main() {
     barrier();
     memoryBarrierShared();
 
-    // only if it's not the first subgroup
-    if (subgroup_id != 0) {
-        // get the results from some previous invocation
-        uvec2 tmp = shared_data[subgroup_inv_id];
-        subgroupBarrier();
-        subgroupMemoryBarrierShared();
-        tmp = subgroupInclusiveAddUint64(tmp);
-        // obtain the result that would be equivalent to the previous result
-        uvec2 shuffled_result = subgroupShuffle(tmp, subgroup_id - 1);
-        for (uint i = 0; i < LOCAL_RESULTS; i++) {
-            results[i] = AddUint64(results[i], shuffled_result);
-        }
+    uvec2 prior_result = uvec2(0);
+    for (uint i = 0; i < subgroup_id; i++) {
+        prior_result = AddUint64(prior_result, shared_data[i]);
+    }
+    for (uint i = 0; i < LOCAL_RESULTS; i++) {
+        results[i] = AddUint64(results[i], prior_result);
     }
     WriteResults(results);
 }

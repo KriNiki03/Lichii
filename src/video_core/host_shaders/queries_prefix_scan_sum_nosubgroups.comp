@@ -32,23 +32,23 @@
 #endif
 
 BEGIN_PUSH_CONSTANTS
-UNIFORM(0) uint min_accumulation_base;
-UNIFORM(1) uint max_accumulation_base;
+UNIFORM(0) uint reset_accumulation;
+UNIFORM(1) uint clear_accumulation;
 UNIFORM(2) uint accumulation_limit;
 UNIFORM(3) uint buffer_offset;
 END_PUSH_CONSTANTS
 
-#define LOCAL_RESULTS 4
-#define QUERIES_PER_INVOC 2048
+#define LOCAL_RESULTS 2
+#define QUERIES_PER_INVOC 1024
 
 layout(local_size_x = QUERIES_PER_INVOC / LOCAL_RESULTS) in;
 
 layout(std430, binding = 0) readonly buffer block1 {
-    uvec2 input_data[gl_WorkGroupSize.x * LOCAL_RESULTS];
+    uvec2 input_data[];
 };
 
 layout(std430, binding = 1) writeonly coherent buffer block2 {
-    uvec2 output_data[gl_WorkGroupSize.x * LOCAL_RESULTS];
+    uvec2 output_data[];
 };
 
 layout(std430, binding = 2) coherent buffer block3 {
@@ -56,6 +56,7 @@ layout(std430, binding = 2) coherent buffer block3 {
 };
 
 shared uvec2 shared_data[gl_WorkGroupSize.x * LOCAL_RESULTS];
+shared uvec2 base_value;
 
 uvec2 AddUint64(uvec2 value_1, uvec2 value_2) {
     uint carry = 0;
@@ -67,21 +68,13 @@ uvec2 AddUint64(uvec2 value_1, uvec2 value_2) {
 
 void main(void) {
     uint id = gl_LocalInvocationID.x;
-    uvec2 base_value[LOCAL_RESULTS];
-    const uvec2 accum = accumulated_data;
-    for (uint i = 0; i < LOCAL_RESULTS; i++) {
-        base_value[i] = (buffer_offset + id * LOCAL_RESULTS + i) < min_accumulation_base
-                            ? accumulated_data
-                            : uvec2(0);
+    if (id == 0) {
+        base_value = reset_accumulation != 0 ? uvec2(0) : accumulated_data;
     }
     uint work_size = gl_WorkGroupSize.x;
     uint rd_id;
     uint wr_id;
     uint mask;
-    uvec2 inputs[LOCAL_RESULTS];
-    for (uint i = 0; i < LOCAL_RESULTS; i++) {
-        inputs[i] = input_data[buffer_offset + id * LOCAL_RESULTS + i];
-    }
     // The number of steps is the log base 2 of the
     // work group size, which should be a power of 2
     const uint steps = uint(log2(work_size)) + uint(log2(LOCAL_RESULTS));
@@ -90,7 +83,8 @@ void main(void) {
     // Each invocation is responsible for the content of
     // two elements of the output array
     for (uint i = 0; i < LOCAL_RESULTS; i++) {
-        shared_data[id * LOCAL_RESULTS + i] = inputs[i];
+        const uint index = id * LOCAL_RESULTS + i;
+        shared_data[index] = index <= accumulation_limit ? input_data[buffer_offset + index] : uvec2(0);
     }
     // Synchronize to make sure that everyone has initialized
     // their elements of shared_data[] with data loaded from
@@ -112,27 +106,14 @@ void main(void) {
         barrier();
         memoryBarrierShared();
     }
-    // Add the accumulation
     for (uint i = 0; i < LOCAL_RESULTS; i++) {
-        shared_data[id * LOCAL_RESULTS + i] =
-            AddUint64(shared_data[id * LOCAL_RESULTS + i], base_value[i]);
-    }
-    barrier();
-    memoryBarrierShared();
-
-    // Finally write our data back to the output buffer
-    for (uint i = 0; i < LOCAL_RESULTS; i++) {
-        output_data[buffer_offset + id * LOCAL_RESULTS + i] = shared_data[id * LOCAL_RESULTS + i];
-    }
-    if (id == 0) {
-        if (min_accumulation_base >= accumulation_limit + 1) {
-            accumulated_data = shared_data[accumulation_limit];
-            return;
+        const uint index = id * LOCAL_RESULTS + i;
+        if (index <= accumulation_limit) {
+            const uvec2 sum = AddUint64(shared_data[index], base_value);
+            output_data[buffer_offset + index] = sum;
+            if (index == accumulation_limit) {
+                accumulated_data = clear_accumulation != 0 ? uvec2(0) : sum;
+            }
         }
-        uvec2 reset_value = shared_data[max_accumulation_base - 1];
-        uvec2 final_value = shared_data[accumulation_limit];
-        // Two complements
-        reset_value = AddUint64(uvec2(1, 0), ~reset_value);
-        accumulated_data = AddUint64(final_value, reset_value);
     }
 }

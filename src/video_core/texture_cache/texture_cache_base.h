@@ -304,6 +304,9 @@ public:
     /// UpdateRenderTargets should be called before this
     Framebuffer* GetFramebuffer();
 
+    /// Find a framebuffer containing only the selected bound color target.
+    Framebuffer* GetColorFramebuffer(u32 slot, Extent2D size);
+
     [[nodiscard]] const RenderTargets& GetRenderTargets() const noexcept {
         return render_targets;
     }

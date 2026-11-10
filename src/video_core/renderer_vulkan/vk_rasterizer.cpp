@@ -1200,68 +1200,6 @@ void RasterizerVulkan::DrawTexture() {
                          sampler->Handle(), dst_region, src_region, src_size);
 }
 
-// A 1-layer depth target bound with a 3D color target limits the framebuffer to one layer, so
-// vkCmdClearAttachments can't reach the target's other slices. Those slices are zeroed by copying
-// zeros into exactly the slices the clear names; the rest of the volume keeps its contents.
-bool RasterizerVulkan::ClearVolumeSlices(const Framebuffer* framebuffer, u32 first_slice,
-                                         u32 slice_count) {
-    const auto& regs = maxwell3d->regs;
-    const u32 target_index = regs.clear_surface.RT;
-    const auto& color_buffer_ids = texture_cache.GetRenderTargets().color_buffer_ids;
-    // Depth and stencil clears take the normal path, so only a colour-only clear qualifies.
-    if (target_index >= color_buffer_ids.size() || regs.clear_surface.Z || regs.clear_surface.S) {
-        return false;
-    }
-    const auto view_id = color_buffer_ids[target_index];
-    const u32 depth = regs.rt[target_index].depth;
-    if (!view_id || depth <= framebuffer->Layers() || first_slice >= depth) {
-        return false;
-    }
-    const auto& view = texture_cache.GetImageView(view_id);
-    const bool is_volume = True(view.flags & VideoCommon::ImageViewFlagBits::Slice);
-    const bool clears_all_channels = regs.clear_surface.R && regs.clear_surface.G &&
-                                     regs.clear_surface.B && regs.clear_surface.A;
-    const bool clears_to_zero =
-        std::ranges::all_of(regs.clear_color, [](f32 value) { return value == 0.0f; });
-    const bool clears_whole_slice = texture_cache.ClearCovers(view.size.width, view.size.height);
-    if (!is_volume || !clears_all_channels || !clears_to_zero || !clears_whole_slice) {
-        return false;
-    }
-    const u32 width = view.size.width;
-    const u32 height = view.size.height;
-    const size_t slice_bytes =
-        size_t{width} * height * VideoCore::Surface::BytesPerBlock(view.format);
-    const auto zeros = staging_pool.Request(slice_bytes, MemoryUsage::Upload);
-    std::memset(zeros.mapped_span.data(), 0, slice_bytes);
-    const u32 count = std::min(slice_count, depth - first_slice);
-    const VkImage image = view.ImageHandle();
-    const u32 level = view.range.base.level;
-    scheduler.RequestOutsideRenderPassOperationContext();
-    scheduler.Record([image, level, width, height, first_slice, count, buffer = zeros.buffer,
-                      offset = zeros.offset](vk::CommandBuffer cmdbuf) {
-        for (u32 slice = first_slice; slice < first_slice + count; ++slice) {
-            const VkBufferImageCopy zero_slice{
-                .bufferOffset = offset,
-                .bufferRowLength = 0,
-                .bufferImageHeight = 0,
-                .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0, 1},
-                .imageOffset = {0, 0, static_cast<s32>(slice)},
-                .imageExtent = {width, height, 1},
-            };
-            cmdbuf.CopyBufferToImage(buffer, image, VK_IMAGE_LAYOUT_GENERAL, zero_slice);
-        }
-        constexpr VkMemoryBarrier clear_finished{
-            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-            .pNext = nullptr,
-            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
-        };
-        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                               0, clear_finished);
-    });
-    return true;
-}
-
 void RasterizerVulkan::Clear(u32 layer_count) {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Clear};
     if (Tegra::Engines::g_nx2_trace_draws_after_upscale > 0) {
@@ -1286,29 +1224,46 @@ void RasterizerVulkan::Clear(u32 layer_count) {
 
     std::scoped_lock lock{texture_cache.mutex};
     texture_cache.UpdateRenderTargets(true);
-    const Framebuffer* const framebuffer = texture_cache.GetFramebuffer();
+    const Framebuffer* framebuffer = texture_cache.GetFramebuffer();
     if (frame_dump.Capturing()) {
         FrameDumpPass(framebuffer);
     }
     const VkExtent2D render_area = framebuffer->RenderArea();
     const u32 base_array_layer = regs.clear_surface.layer;
-    const auto clear_layers =
+    const u32 color_attachment = regs.clear_surface.RT;
+    const auto& color_views = texture_cache.GetRenderTargets().color_buffer_ids;
+    const auto color_view_id = use_color && color_attachment < color_views.size()
+                                   ? color_views[color_attachment]
+                                   : VideoCommon::ImageViewId{};
+    const bool has_color_target =
+        color_view_id && color_view_id != VideoCommon::NULL_IMAGE_VIEW_ID;
+    const bool color_full_channels = regs.clear_surface.R && regs.clear_surface.G &&
+                                     regs.clear_surface.B && regs.clear_surface.A;
+    auto clear_layers =
         GetFramebufferClearLayers(base_array_layer, layer_count, framebuffer->Layers());
+    if (has_color_target && color_full_channels && !use_depth && !use_stencil) {
+        const auto& view = texture_cache.GetImageView(color_view_id);
+        const auto volume_layers = GetFramebufferClearLayers(
+            base_array_layer, layer_count, static_cast<u32>(view.range.extent.layers));
+        if (True(view.flags & VideoCommon::ImageViewFlagBits::Slice) &&
+            volume_layers.count > clear_layers.count) {
+            // Other attachments can limit the framebuffer to fewer slices than the color view.
+            // Keep the guest rectangle and layer range by clearing that view in its own pass.
+            framebuffer = texture_cache.GetColorFramebuffer(
+                color_attachment, {render_area.width, render_area.height});
+            clear_layers = volume_layers;
+        }
+    }
     if (clear_layers.count != layer_count) {
         LOG_DEBUG(Render_Vulkan,
                   "Framebuffer clear layers: base={}, requested={}, clipped={}, framebuffer={}",
                   base_array_layer, layer_count, clear_layers.count, framebuffer->Layers());
-    }
-    if (ClearVolumeSlices(framebuffer, base_array_layer, layer_count)) {
-        return;
     }
     if (clear_layers.count == 0) {
         return;
     }
 
     constexpr bool ENABLE_DEFERRED_CLEAR = true;
-    const bool color_full_channels = regs.clear_surface.R && regs.clear_surface.G &&
-                                     regs.clear_surface.B && regs.clear_surface.A;
     const bool stencil_partial = use_stencil && framebuffer->HasAspectStencilBit() &&
                                  regs.stencil_front_mask != 0xFF && regs.stencil_front_mask != 0;
     const bool ds_used = use_depth || use_stencil;
@@ -1409,8 +1364,7 @@ void RasterizerVulkan::Clear(u32 layer_count) {
                               !can_defer_clear && regs.zpass_pixel_count_enable);
     UpdateViewportsState(regs);
 
-    const u32 color_attachment = regs.clear_surface.RT;
-    if (use_color && framebuffer->HasAspectColorBit(color_attachment)) {
+    if (has_color_target) {
         const auto format = VideoCore::Surface::PixelFormatFromRenderTargetFormat(regs.rt[color_attachment].format);
         bool is_integer = IsPixelFormatInteger(format);
         bool is_signed = IsPixelFormatSignedInteger(format);

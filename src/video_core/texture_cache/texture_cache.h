@@ -964,6 +964,15 @@ typename P::Framebuffer* TextureCache<P>::GetFramebuffer() {
 }
 
 template <class P>
+typename P::Framebuffer* TextureCache<P>::GetColorFramebuffer(u32 slot, Extent2D size) {
+    RenderTargets key{};
+    key.color_buffer_ids[slot] = render_targets.color_buffer_ids[slot];
+    key.size = size;
+    key.is_rescaled = render_targets.is_rescaled;
+    return &slot_framebuffers[GetFramebufferId(key)];
+}
+
+template <class P>
 ImageViewId TextureCache<P>::VisitImageView(u32 index, bool compute) {
     auto& table = compute ? channel_state->compute_image_table : channel_state->graphics_image_table;
     index = Tegra::Texture::TextureHeaderIndex(index, table.current_limit,
@@ -4335,8 +4344,9 @@ bool TextureCache<P>::IsFullClear(ImageViewId id) {
     const ImageViewBase& image_view = slot_image_views[id];
     const ImageBase& image = slot_images[image_view.image_id];
     const Extent3D size = image_view.size;
-    if (image.info.resources.levels > 1 || image.info.resources.layers > 1) {
-        // Images with multiple resources can't be cleared in a single call
+    if (True(image_view.flags & ImageViewFlagBits::Slice) || image.info.resources.levels > 1 ||
+        image.info.resources.layers > 1) {
+        // A clear may only cover a single slice, layer, or mip level.
         return false;
     }
     // Make sure the clear covers all texels in the subresource
