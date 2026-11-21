@@ -224,7 +224,11 @@ bool DmaPusher::Step() {
                 header.size};
             RecordParsedEntry(header, commands);
             Nx2CmdPageDiag::CountEntry(Nx2CmdPageDiag::Path::Submitted);
+            if (!command_list.dusk_packets.empty()) {
+                dusk_parsed_words = commands;
+            }
             command_resume_offset += ProcessCommands(commands, 0);
+            dusk_parsed_words = {};
         } else if (use_safe) {
             Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::SafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
             const std::span<const CommandHeader> commands{headers.data(), headers.size()};
@@ -453,6 +457,32 @@ bool DmaPusher::WantsSegment() const {
            (engine == Engines::EngineTypes::Maxwell3D && dma_state.method >= MacroRegistersStart);
 }
 
+Core::DuskRuntimeTrace::Source DmaPusher::DuskSource(u32 amount) const {
+    using namespace Core::DuskRuntimeTrace;
+    if (dusk_parsed_words.empty() || dma_state.method != 0xe05 || amount != 4 ||
+        amount != dma_state.method_count || dma_state.dma_word_offset < 2 * sizeof(u32) ||
+        subchannel_type[dma_state.subchannel] != Engines::EngineTypes::Maxwell3D) {
+        return {};
+    }
+    // IncreaseOnce sends the first parameter to 0xe04 and the remaining four to 0xe05.
+    const size_t word = dma_state.dma_word_offset / sizeof(u32) - 2;
+    const auto& list = dma_pushbuffer.front();
+    const auto key = std::pair{dma_pushbuffer_subindex, word};
+    const auto tag = std::ranges::lower_bound(list.dusk_packets, key, {},
+        [](const SubmittedPacket& packet) {
+            return std::pair<size_t, size_t>{packet.entry, packet.offset};
+        });
+    if (tag == list.dusk_packets.end() || tag->entry != dma_pushbuffer_subindex ||
+        tag->offset != word || word + PacketWords > dusk_parsed_words.size() ||
+        !std::ranges::equal(tag->packet.words, dusk_parsed_words.subspan(word, PacketWords),
+                            {}, std::identity{}, &CommandHeader::argument)) {
+        return {};
+    }
+    return {tag->packet.event, tag->packet.worker, tag->packet.header, tag->packet.buffer,
+            list.dusk_submission, tag->packet.gpu, tag->entry, channel_state.bind_id,
+            memory_manager.GetID()};
+}
+
 void DmaPusher::CallMethod(u32 argument) {
     if (g_semaphore_watch != 0) [[unlikely]] {
         WatchArgument(dma_state.method, argument);
@@ -555,7 +585,16 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
                 split.NoteUnboundedMemoryWriter();
             }
         };
+        const auto source = DuskSource(num_methods);
         if (split.Active()) {
+            if (source.event) {
+                split.Defer([source] { Core::DuskRuntimeTrace::current_source = source; });
+            }
+            SCOPE_EXIT {
+                if (source.event) {
+                    split.Defer([] { Core::DuskRuntimeTrace::current_source = {}; });
+                }
+            };
             const GPUVAddr segment = dma_state.dma_get + dma_state.dma_word_offset;
             if (split.FrontMacros()) {
                 const auto type = subchannel_type[dma_state.subchannel];
@@ -586,11 +625,14 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
         VideoCommon::Nx2Profile::Scope method_scope{VideoCommon::Nx2Profile::Zone::Method};
         subchannel->ConsumeSink(system);
         subchannel->current_dma_segment = dma_state.dma_get + dma_state.dma_word_offset;
-        subchannel->CallMultiMethod(system, dma_state.method, base_start, num_methods, dma_state.method_count);
+        const Core::DuskRuntimeTrace::SourceScope scope{source};
+        subchannel->CallMultiMethod(system, dma_state.method, base_start, num_methods,
+                                   dma_state.method_count);
     }
 }
 
 void DmaPusher::RefreshSnapshot(CommandList& list, u64 now) {
+    list.dusk_packets.clear();
     list.snapshot_suspensions = now;
     for (size_t i = 0; i < list.command_lists.size() && i < list.submitted_offsets.size(); ++i) {
         const CommandListHeader& entry = list.command_lists[i];

@@ -7,6 +7,7 @@
 #pragma once
 
 #include <array>
+#include <filesystem>
 #include <optional>
 #include <string_view>
 
@@ -88,7 +89,8 @@ public:
     explicit RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra::GPU& gpu_,
                               Tegra::MaxwellDeviceMemoryManager& device_memory_,
                               const Device& device_, MemoryAllocator& memory_allocator_,
-                              StateTracker& state_tracker_, Scheduler& scheduler_);
+                              StateTracker& state_tracker_, Scheduler& scheduler_,
+                              std::filesystem::path dusk_camera_trigger_);
     ~RasterizerVulkan() override;
 
     void Draw(bool is_indexed, u32 instance_count) override;
@@ -136,6 +138,7 @@ public:
     void TiledCacheBarrier() override;
     void FlushCommands() override;
     void TickFrame() override;
+    void TraceDuskPresent(const Tegra::FramebufferConfig& framebuffer);
     bool AccelerateConditionalRendering() override;
     bool HasDrawTransformFeedback() override;
     bool AccelerateSurfaceCopy(const Tegra::Engines::Fermi2D::Surface& src,
@@ -243,6 +246,7 @@ private:
     void FrameDumpPass(const Framebuffer* framebuffer);
     /// EDEN_NX2_PENDING_WRITE_TRACE: logs bound buffer ranges with collected, unapplied CPU writes.
     void TracePendingCpuWrites(bool compute, std::span<const u64> shader_hashes);
+    void TraceDuskCamera();
     /// Records the uniform and storage buffers of the current draw or dispatch for the frame dump.
     bool FrameDumpBuffers(bool compute, std::span<const u64> shader_hashes);
 
@@ -279,6 +283,11 @@ private:
 
     u32 draw_counter = 0;
     u64 render_trace_frame = 0;
+    const std::filesystem::path dusk_camera_trigger;
+    bool dusk_camera_marker_present{};
+    bool dusk_camera_armed{};
+    bool dusk_reconstruction_armed{};
+    bool dusk_present_armed{};
     u32 render_trace_draws = 0;
     u32 render_trace_clears = 0;
     bool pending_native_work{};

@@ -21,6 +21,7 @@
 #include "common/logging.h"
 #include "common/settings.h"
 #include "shader_recompiler/exception.h"
+#include "core/arm/dynarmic/dusk_ultrawide.h"
 #include "core/core.h"
 #include "video_core/gpu_split.h"
 #include "video_core/fire_emblem_upscale.h"
@@ -1249,6 +1250,13 @@ bool KeplerCompute::ScaleDlssRenderRegion(GPUVAddr constants,
             regions, {input->Width(), input->Height()}, {output->Width(), output->Height()})) {
         return reject("active input or output exceeds its bounds");
     }
+    const auto wide = regions.output == VideoCommon::DlssContract::DuskWideOutput
+                          ? Core::DuskUltrawide::session.load() : nullptr;
+    if (wide && !VideoCommon::DlssContract::ValidDuskWideRegions(
+                    regions, {input->Width(), input->Height()},
+                    {output->Width(), output->Height()})) {
+        return reject("3440x1440 output requires a matching active scene aspect");
+    }
     if (!jitter || !motion || !depth) {
         return reject(!jitter ? "missing current jitter" : !motion ? "missing current scene motion"
                                                                   : "missing current scene depth");
@@ -1281,6 +1289,16 @@ bool KeplerCompute::ScaleDlssRenderRegion(GPUVAddr constants,
         dusk_dlss_motion_multiplier[0] / static_cast<f32>(regions.output[0]),
         dusk_dlss_motion_multiplier[1] / static_cast<f32>(regions.output[1]),
     };
+    if (wide && wide->First(Core::DuskUltrawide::Event::WideReconstructionGeometry)) {
+        TraceDuskDlss(true, "wide contract: render={}x{} output={}x{} "
+                           "color={}x{} motion={}x{} depth={}x{} output_backing={}x{} "
+                           "jitter=({},{}) motion_scale=({},{}) guest_reset={}",
+                      regions.render[0], regions.render[1], regions.output[0], regions.output[1],
+                      input->Width(), input->Height(), motion->Width(), motion->Height(),
+                      depth->Width(), depth->Height(), output->Width(), output->Height(),
+                      jitter->offset[0], jitter->offset[1], motion_scale[0], motion_scale[1],
+                      regions.reset);
+    }
     TraceDuskDlss(trace, "temporal inputs: jitter=({}, {}) motion scale=({}, {}) reset={}",
                   jitter->offset[0], jitter->offset[1], motion_scale[0], motion_scale[1],
                   regions.reset);

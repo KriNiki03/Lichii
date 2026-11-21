@@ -18,9 +18,11 @@
 #include <ranges>
 #include "common/scope_exit.h"
 #include "common/settings.h"
+#include "core/arm/dynarmic/dusk_ultrawide.h"
 #include "core/core_timing.h"
 #include "core/frontend/graphics_context.h"
 #include "video_core/capture.h"
+#include "video_core/dlss_contract.h"
 #include "video_core/gpu.h"
 #include "video_core/present.h"
 #include "video_core/render_trace.h"
@@ -127,7 +129,8 @@ Device CreateDevice(const vk::Instance& instance, const vk::InstanceDispatch& dl
 RendererVulkan::RendererVulkan(Core::Frontend::EmuWindow& emu_window,
                                Tegra::MaxwellDeviceMemoryManager& device_memory_,
                                Tegra::GPU& gpu_,
-                               std::unique_ptr<Core::Frontend::GraphicsContext> context_)
+                               std::unique_ptr<Core::Frontend::GraphicsContext> context_,
+                               std::filesystem::path dusk_camera_trigger)
 try
     : RendererBase(emu_window, std::move(context_))
     , device_memory(device_memory_)
@@ -182,7 +185,8 @@ try
                   present_manager,
                   scheduler,
                   PresentFiltersForAppletCapture)
-    , rasterizer(render_window, gpu, device_memory, device, memory_allocator, state_tracker, scheduler)
+    , rasterizer(render_window, gpu, device_memory, device, memory_allocator, state_tracker,
+                 scheduler, std::move(dusk_camera_trigger))
 #ifdef HAS_LSFG
     , frame_gen(memory_allocator, scheduler)
 #endif
@@ -261,10 +265,37 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
         }
     }
 
+    auto layout = render_window.GetFramebufferLayout();
+    if (framebuffers.size() == 1 && Core::DuskUltrawide::Enabled()) {
+        using Core::DuskUltrawide::Event;
+        if (const auto session = Core::DuskUltrawide::session.load()) {
+            const auto& source = framebuffers.front();
+            const auto& crop = source.crop_rect;
+            constexpr auto output = VideoCommon::DlssContract::DuskWideOutput;
+            const bool wide_crop = source.has_guest_crop && crop.left == 0 && crop.top == 0 &&
+                crop.right == static_cast<int>(output[0]) && crop.bottom == static_cast<int>(output[1]) &&
+                VideoCommon::DlssContract::FitsExtent(output, {source.width, source.height});
+            if (wide_crop) {
+                layout.screen = Layout::FrameLayoutWithAspect(
+                    layout.width, layout.height, static_cast<float>(output[1]) / output[0]).screen;
+            }
+            const bool applied = session->Seen(Event::Applied);
+            if ((applied || wide_crop) &&
+                session->First(wide_crop ? Event::WidePresentGeometry : Event::PresentGeometry)) {
+                const auto& dest = layout.screen;
+                LOG_INFO(Render_Vulkan,
+                         "Dusk ultrawide present: source={}x{} crop=({},{})..({},{}) "
+                         "host={}x{} dest=({},{})..({},{}) camera_applied={} wide_crop={}",
+                         source.width, source.height, crop.left, crop.top, crop.right, crop.bottom,
+                         layout.width, layout.height, dest.left, dest.top, dest.right, dest.bottom,
+                         applied, wide_crop);
+            }
+        }
+    }
     scheduler.RequestOutsideRenderPassOperationContext();
     blit_swapchain.DrawToFrame(device, rasterizer, frame, framebuffers,
-                              render_window.GetFramebufferLayout(),
-                              present_manager.SwapchainImageCount(), output_format, hdr_output);
+                              layout, present_manager.SwapchainImageCount(), output_format,
+                              hdr_output);
 
 #ifdef HAS_LSFG
     if (hdr_output) {
@@ -300,6 +331,9 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
 #endif
 
     gpu.RendererFrameEndNotify();
+    if (!framebuffers.empty()) {
+        rasterizer.TraceDuskPresent(framebuffers.front());
+    }
     rasterizer.TickFrame();
     if (trace) {
         const auto end = std::chrono::steady_clock::now();

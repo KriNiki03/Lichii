@@ -21,6 +21,21 @@ TEST_CASE("Duskbloods temporal geometry uses active rectangles within the backin
     REQUIRE_FALSE(DC::ValidDepthFormat(PixelFormat::R32_FLOAT, true));
 }
 
+TEST_CASE("Duskbloods 3440x1440 reconstruction rejects a stock aspect or stale backing",
+          "[dlss_contract]") {
+    constexpr std::array<unsigned, 2> wide{3440, 1440};
+    constexpr std::array<unsigned, 2> stock{1920, 1080};
+    constexpr DC::TemporalRegions regions{{1988, 832}, wide};
+    REQUIRE(DC::ValidDuskWideRegions(regions, wide, wide));
+    REQUIRE(DC::ValidDuskWideRegions({{1984, 832}, wide}, wide, wide));
+    REQUIRE_FALSE(DC::ValidDuskWideRegions({{1996, 832}, wide}, wide, wide));
+    REQUIRE_FALSE(DC::ValidDuskWideRegions({{1108, 624}, wide}, wide, wide));
+    REQUIRE_FALSE(DC::ValidDuskWideRegions(regions, stock, wide));
+    REQUIRE_FALSE(DC::ValidDuskWideRegions(regions, wide, stock));
+    REQUIRE_FALSE(DC::ValidDuskWideRegions({{1108, 624}, stock}, stock, stock));
+    REQUIRE(DC::ValidRegions({{1108, 624}, stock}, stock, stock));
+}
+
 TEST_CASE("Spatial cutscene replacement decodes sRGB into float without temporal history",
           "[dlss_contract]") {
     using VideoCore::Surface::PixelFormat;

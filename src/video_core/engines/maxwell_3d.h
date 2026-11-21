@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include "core/arm/dynarmic/dusk_runtime_trace.h"
+
 #include <array>
 #include <bitset>
 #include <cmath>
@@ -3062,6 +3064,7 @@ public:
         enum class DrawMode : u32 { General = 0, Instance, InlineIndex };
         struct State {
             Maxwell3D::Regs::PrimitiveTopology topology{};
+            Core::DuskRuntimeTrace::Source dusk_source{};
             DrawMode draw_mode{};
             bool draw_indexed{};
             u32 draw_element_count{}; // Zero for indirect draws whose count is not known yet.

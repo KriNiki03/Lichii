@@ -677,10 +677,21 @@ void GDBStub::HandleRcmd(const std::vector<u8>& command) {
         auto modules = Core::FindModules(debug_process);
 
         reply = fmt::format("Process:     {:#x} ({})\n"
-                            "Program Id:  {:#018x}\n",
+                            "Program Id:  {:#018x}\n"
+                            "Main NSO build ID: {}\n",
                             debug_process->GetProcessId(),
                             debug_process->GetName(),
-                            debug_process->GetProgramId());
+                            debug_process->GetProgramId(),
+                            Common::HexToString(system.GetApplicationProcessBuildID(), false));
+        Loader::AppLoader::Modules loaded_modules;
+        if (system.GetAppLoader().ReadNSOModules(loaded_modules) == Loader::ResultStatus::Success) {
+            for (const auto& [address, name] : loaded_modules) {
+                if (name == "main") {
+                    reply += fmt::format("Main NSO base: {:#x}\n", address);
+                    break;
+                }
+            }
+        }
         reply += fmt::format(
             "Layout:\n"
             "  Alias: {:#012x} - {:#012x}\n"

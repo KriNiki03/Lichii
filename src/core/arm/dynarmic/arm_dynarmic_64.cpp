@@ -12,6 +12,9 @@
 #include "common/settings.h"
 #include "core/arm/dynarmic/arm_dynarmic.h"
 #include "core/arm/dynarmic/arm_dynarmic_64.h"
+#include "core/arm/dynarmic/dusk_camera_trace.h"
+#include "core/arm/dynarmic/dusk_runtime_trace.h"
+#include "core/arm/dynarmic/dusk_ultrawide.h"
 #include "core/arm/dynarmic/dynarmic_exclusive_monitor.h"
 #include "core/arm/dynarmic/window_trace.h"
 #include "core/core_timing.h"
@@ -21,6 +24,385 @@
 namespace Core {
 
 using namespace Common::Literals;
+
+namespace {
+
+void ReportDuskCameraRejection(DuskUltrawide::Session& session, DuskUltrawide::Event event,
+                               std::string_view field, u64 observed, std::string_view comparison,
+                               u64 expected) {
+    if (session.First(event)) {
+        LOG_INFO(Core_ARM, "Dusk ultrawide camera rejected: {} observed={:#x}, expected {} {:#x}{}",
+                 field, observed, comparison, expected,
+                 observed == DuskUltrawide::Unmapped ? " (unmapped)" : "");
+    }
+}
+
+template <typename T>
+T ReadDuskTrace(Memory::Memory& memory, u64 address) {
+    T value{};
+    if (memory.IsValidVirtualAddressRange(address, sizeof(value))) {
+        memory.ReadBlockUnsafe(address, &value, sizeof(value));
+    }
+    return value;
+}
+
+void ObserveDuskRuntime(DuskRuntimeTrace::Session& trace, u32 rva, Dynarmic::A64::Jit& jit,
+                        Memory::Memory& memory, u64 tls) {
+    using namespace DuskRuntimeTrace;
+    std::scoped_lock lock{trace.mutex};
+    if (!trace.Active()) {
+        return;
+    }
+    const auto reg = [&](size_t index) { return jit.GetRegister(index); };
+    const auto read = [&](u64 address) { return ReadDuskTrace<u64>(memory, address); };
+    const u64 sp = jit.GetSP();
+    const u64 lr = reg(30);
+    const auto worker = std::ranges::find(trace.workers, tls, &Worker::tls);
+    const auto replay = std::ranges::find(trace.replays, tls, &Replay::tls);
+    const auto event = [&] {
+        if (trace.event_count >= 768) {
+            if (!std::exchange(trace.overflow, true)) {
+                LOG_INFO(Core_ARM, "Dusk runtime trace limit reached");
+            }
+            return u64{0};
+        }
+        ++trace.event_count;
+        return ++trace.sequence;
+    };
+    switch (rva) {
+    case 0x456bba8:
+        if (worker == trace.workers.end() && trace.admitted_workers < 32) {
+            ++trace.admitted_workers;
+            trace.workers.push_back({tls, sp, ++trace.sequence});
+        }
+        return;
+    case 0x43d1518: {
+        const u64 payload = reg(2);
+        std::erase_if(trace.lists, [&](const List& list) { return list.payload == payload; });
+        if (worker != trace.workers.end() && read(reg(29) + 8) == trace.main_base + 0x433fb04) {
+            if (const u64 seq = event()) {
+                const u64 header = read(payload + 0x40);
+                worker->task = reg(19);
+                trace.lists.push_back({worker->id, payload, header});
+                LOG_INFO(Core_ARM,
+                         "Dusk runtime seq={} list worker={} task={:#x} payload={:#x} header={:#x} count={}",
+                         seq, worker->id, worker->task, payload, header,
+                         header ? ReadDuskTrace<u32>(memory, header + 8) : 0);
+            }
+        }
+        return;
+    }
+    case 0x43e33a0: {
+        const u64 payload = reg(1);
+        const auto list = std::ranges::find(trace.lists, payload, &List::payload);
+        if (replay == trace.replays.end() && list != trace.lists.end() && list->header &&
+            read(payload + 0x40) == list->header && trace.replays.size() < 32) {
+            trace.replays.push_back({tls, sp, *list});
+        }
+        return;
+    }
+    case 0x43e6010:
+        if (replay != trace.replays.end() && sp + 0x7c0 == replay->sp) {
+            trace.replays.erase(replay);
+        }
+        return;
+    case 0x5c41e0: {
+        // AddCommandMemory replaces a pool slice even when its address and contents recur.
+        const u64 begin = read(reg(1) + 0x18) + reg(2);
+        const u64 size = reg(3);
+        if (size <= ~u64{0} - begin) {
+            trace.Reuse(begin, size);
+        }
+        return;
+    }
+    case 0x604604: {
+        if (trace.packets.empty() && replay == trace.replays.end()) {
+            return;
+        }
+        const u64 buffer = reg(19);
+        const u64 cpu = reg(1) + 0x10;
+        const u64 cpu_base = read(buffer + 0x38);
+        const u64 gpu_base = read(buffer + 0x60);
+        if (!cpu_base || !gpu_base || cpu < cpu_base || cpu - cpu_base >= 0x800000) {
+            return;
+        }
+        const u64 gpu = gpu_base + (cpu - cpu_base);
+        trace.Reuse(gpu - 0x10, 0x30);
+        if (replay == trace.replays.end() || lr != trace.main_base + 0x43d473c) {
+            return;
+        }
+        if (trace.emitted_count >= Session::MaxPackets) {
+            if (!std::exchange(trace.overflow, true)) {
+                LOG_INFO(Core_ARM, "Dusk runtime trace packet limit reached");
+            }
+            return;
+        }
+        const auto words = ReadDuskTrace<std::array<u32, PacketWords>>(memory, cpu);
+        const std::array<const u8*, 2> backing{memory.GetPointerSilent(cpu),
+                                              memory.GetPointerSilent(cpu + sizeof(words) - 1)};
+        if (words.front() == IndexedMacroHeader && backing.front() && backing.back()) {
+            trace.packets.emplace(gpu, Packet{++trace.sequence, replay->list.worker,
+                                              replay->list.header, buffer, gpu, backing, words});
+            ++trace.emitted_count;
+        }
+        return;
+    }
+    default:
+        break;
+    }
+    if (worker == trace.workers.end()) {
+        return;
+    }
+    if (rva == 0x42093a0 &&
+        (lr == trace.main_base + 0x433e15c || lr == trace.main_base + 0x4343d78)) {
+        worker->dispatch_sp = sp;
+        worker->task = reg(1);
+        if (const u64 seq = event()) {
+            const u64 owner = reg(0);
+            const u64 begin = read(owner + 0x70);
+            const u64 end = read(owner + 0x78);
+            LOG_INFO(Core_ARM,
+                     "Dusk runtime seq={} dispatch worker={} return_rva={:#x} owner={:#x} task={:#x} "
+                     "primary={:#x} alternate={:#x} guard_flags={:#x} receivers={}",
+                     seq, worker->id, lr - trace.main_base, owner, worker->task,
+                     read(worker->task + 0x448), read(worker->task + 0x748),
+                     ReadDuskTrace<u16>(memory, owner + 0x3a0), end >= begin ? (end - begin) / 8 : 0);
+        }
+    } else if (worker->dispatch_sp && sp + 0x50 == worker->dispatch_sp) {
+        if (rva == 0x4209404) {
+            if (const u64 seq = event()) {
+                LOG_INFO(Core_ARM, "Dusk runtime seq={} guards-passed worker={}", seq, worker->id);
+            }
+        } else if (rva == 0x42094f4) {
+            worker->target = reg(8);
+            if (const u64 seq = event()) {
+                const u64 task = reg(1);
+                LOG_INFO(Core_ARM,
+                         "Dusk runtime seq={} receiver-enter worker={} index={} object={:#x} "
+                         "vtable={:#x} target={:#x} task={:#x} task_vtable={:#x} "
+                         "volume_vtable={:#x} task_73c={:#x} scene={:#x}",
+                         seq, worker->id, reg(4) - 8, reg(0), read(reg(0)), reg(8), task,
+                         read(task), read(task + 0x120), ReadDuskTrace<u32>(memory, task + 0x73c),
+                         reg(3));
+            }
+        } else if (rva == 0x42094f8) {
+            if (const u64 seq = event()) {
+                LOG_INFO(Core_ARM,
+                         "Dusk runtime seq={} receiver-return worker={} index={} target={:#x}",
+                         seq, worker->id, reg(22) - 8, worker->target);
+            }
+        }
+    } else if (rva == 0x4209588 && sp == worker->dispatch_sp) {
+        worker->dispatch_sp = 0;
+        if (const u64 seq = event()) {
+            LOG_INFO(Core_ARM, "Dusk runtime seq={} dispatcher-return worker={}", seq, worker->id);
+        }
+    } else if (rva == 0x4346a4c && worker->task == sp + 0xc00) {
+        if (const u64 seq = event()) {
+            LOG_INFO(Core_ARM, "Dusk runtime seq={} task-frame-release worker={} task={:#x}",
+                     seq, worker->id, worker->task);
+        }
+    } else if (rva == 0x456bbac && sp == worker->sp) {
+        if (worker->task) {
+            if (const u64 seq = event()) {
+                LOG_INFO(Core_ARM, "Dusk runtime seq={} worker-frame-release worker={}",
+                         seq, worker->id);
+            }
+        }
+        trace.workers.erase(worker);
+    }
+}
+
+void ResumeDuskRuntime(u32 rva, u64 pc, Dynarmic::A64::Jit& jit, Memory::Memory& memory) {
+    const u64 sp = jit.GetSP();
+    const auto call = [&](u64 target) {
+        jit.SetRegister(30, pc + 4);
+        jit.SetPC(target);
+    };
+    switch (rva) {
+    case 0x456bba8:
+        call(pc - 0x1908);
+        break;
+    case 0x456bbac:
+        jit.SetSP(sp + 0xc20);
+        break;
+    case 0x4346a4c:
+        jit.SetSP(sp + 0x1000);
+        break;
+    case 0x42093a0:
+        jit.SetRegister(8, memory.Read8(jit.GetRegister(0) + 0x3a0));
+        break;
+    case 0x4209404:
+        jit.SetRegister(24, memory.Read64(jit.GetRegister(19) + 0x6a8));
+        break;
+    case 0x42094f4:
+        call(jit.GetRegister(8));
+        break;
+    case 0x42094f8:
+        if (jit.GetRegister(25) & 1) {
+            jit.SetPC(pc - 0x38);
+        }
+        break;
+    case 0x4209588:
+        jit.SetPC(jit.GetRegister(30));
+        break;
+    case 0x43d1518:
+        call(pc + 0x10da44);
+        break;
+    case 0x43e6010:
+        jit.SetSP(sp + 0x720);
+        break;
+    case 0x604604:
+        jit.SetRegister(20, memory.Read64(sp + 0x30));
+        jit.SetRegister(19, memory.Read64(sp + 0x38));
+        break;
+    default: // PACIBSP is a hint in Dynarmic.
+        break;
+    }
+}
+
+template <size_t Size>
+std::string CameraWords(Memory::Memory& memory, u64 address) {
+    std::array<u32, Size> words;
+    if (!memory.IsValidVirtualAddressRange(address, sizeof(words)) ||
+        !memory.ReadBlock(address, words.data(), sizeof(words))) {
+        return "unmapped";
+    }
+    return fmt::format("{:08x}", fmt::join(words, " "));
+}
+
+void TraceDuskCamera(DuskCameraTrace::Session& trace, const DuskCameraTrace::Site& site,
+                     Dynarmic::A64::Jit& jit, Memory::Memory& memory, u64 tls) {
+    const u64 rva = site.rva;
+    const u64 x0 = jit.GetRegister(0);
+    const u64 x1 = jit.GetRegister(1);
+    const u64 x19 = jit.GetRegister(19);
+    const u64 x20 = jit.GetRegister(20);
+    const bool saved_lr = rva == 0x416bb28 || rva == 0x44e6e18 || rva == 0x44de8b4;
+    const u64 lr = saved_lr ? memory.Read64(jit.GetRegister(29) + 8) : jit.GetRegister(30);
+    const u64 caller = lr >= trace.base ? lr - trace.base : 0;
+    const bool volume = rva == 0x44e638c || rva == 0x44e6e18;
+    if (volume && caller != DuskCameraTrace::PrimaryReturn &&
+        caller != DuskCameraTrace::ReceiverReturn) {
+        return;
+    }
+    if ((rva == 0x44de26c && caller != 0x453d594 && caller != 0x453d7bc) ||
+        (rva == 0x44de8b4 && (caller != 0x453ddc8 || !jit.GetRegister(21))) ||
+        (rva == 0x1ce2c60 && caller != 0x1cdd2bc)) {
+        return;
+    }
+    const u64 frame = trace.Take(site);
+    if (!frame) {
+        return;
+    }
+
+    std::string data;
+    switch (rva) {
+    case 0x416abbc:
+        data = fmt::format("descriptor={:#x} out={:#x} working_50={}", x0, jit.GetRegister(8),
+                           CameraWords<20>(memory, x0 + 0x50));
+        break;
+    case 0x416ad5c:
+        data = fmt::format("descriptor={:#x} out={:#x} projection={}", x20, x19,
+                           CameraWords<16>(memory, x19));
+        break;
+    case 0x416ba38:
+        data = fmt::format("source={:#x} descriptor={:#x} source_50={}", x1, x0,
+                           CameraWords<12>(memory, x1 + 0x50));
+        break;
+    case 0x416bb28:
+        data = fmt::format("source={:#x} descriptor={:#x} working_50={}", x20, x19,
+                           CameraWords<20>(memory, x19 + 0x50));
+        break;
+    case 0x453d2f8: {
+        const u64 source = memory.IsValidVirtualAddressRange(x0 + 8, sizeof(u64))
+                               ? memory.Read64(x0 + 8)
+                               : 0;
+        data = fmt::format("packet={:#x} source={:#x} camera={:#x}", x0, source, x1);
+        break;
+    }
+    case 0x44e638c: {
+        const u64 object = x0 - 0x120;
+        data = fmt::format("volume={:#x} descriptor={:#x} object={:#x} working_50={} "
+                           "view={} projection={} view_projection={}",
+                           x0, x1, object, CameraWords<20>(memory, x1 + 0x50),
+                           CameraWords<16>(memory, object + 0x10),
+                           CameraWords<16>(memory, object + 0x50),
+                           CameraWords<16>(memory, object + 0x90));
+        break;
+    }
+    case 0x44e6e18:
+        data = fmt::format("volume={:#x} effective_aspect={:08x} planes={}", x19,
+                           memory.Read32(x19 + 0x14c), CameraWords<24>(memory, x19 + 0x160));
+        break;
+    case 0x44de26c: {
+        const u64 camera = jit.GetRegister(4);
+        const u64 initializer_fp = jit.GetRegister(29);
+        const bool valid_frame = memory.IsValidVirtualAddressRange(initializer_fp, 16);
+        const u64 initializer_lr = valid_frame ? memory.Read64(initializer_fp + 8) : 0;
+        u64 dispatch_lr = 0;
+        if (initializer_lr == trace.base + 0x44ef6d4 || initializer_lr == trace.base + 0x44f00a0) {
+            // Both return sites belong to 44ef620, which saves its incoming LR at FP+8.
+            const u64 dispatch_fp = memory.Read64(initializer_fp);
+            if (memory.IsValidVirtualAddressRange(dispatch_fp, 16)) {
+                dispatch_lr = memory.Read64(dispatch_fp + 8);
+            }
+        }
+        data = fmt::format("task={:#x} original={:#x} initializer_lr={:#x} dispatch_lr={:#x} "
+                           "working_50={}",
+                           x0, camera, initializer_lr, dispatch_lr,
+                           CameraWords<20>(memory, camera + 0x50));
+        break;
+    }
+    case 0x44de8b4: {
+        const u64 descriptor = jit.GetRegister(21);
+        data = fmt::format("original={:#x} source={:#x} source_50={}", x20, descriptor,
+                           CameraWords<12>(memory, descriptor + 0x50));
+        break;
+    }
+    case 0x1ce2c60: {
+        std::array<u64, 3> cameras{};
+        const u64 source_slot = trace.base + 0x5b415e0;
+        if (!memory.IsValidVirtualAddressRange(x0 + 0x10, sizeof(cameras)) ||
+            !memory.ReadBlock(x0 + 0x10, cameras.data(), sizeof(cameras)) ||
+            !memory.IsValidVirtualAddressRange(source_slot, sizeof(u64))) {
+            return;
+        }
+        const u64 source_owner = memory.Read64(source_slot);
+        if (!source_owner || !memory.IsValidVirtualAddressRange(source_owner + 8, sizeof(u64))) {
+            return;
+        }
+        const u64 source = memory.Read64(source_owner + 8);
+        const auto [original, staging, provider] = cameras;
+        const u64 table = memory.IsValidVirtualAddressRange(provider, sizeof(u64))
+                              ? memory.Read64(provider)
+                              : 0;
+        const u64 converter = memory.IsValidVirtualAddressRange(table + 0x20, sizeof(u64))
+                                  ? memory.Read64(table + 0x20)
+                                  : 0;
+        data = fmt::format("owner={:#x} original={:#x} staging={:#x} provider={:#x} "
+                           "converter={:#x} source={:#x} source_50={} prior_50={}",
+                           x0, original, staging, provider, converter, source,
+                           CameraWords<6>(memory, source + 0x50),
+                           CameraWords<8>(memory, original + 0x50));
+        break;
+    }
+    case 0x4566d20: {
+        if (!memory.IsValidVirtualAddressRange(x0 + 0x40, sizeof(u64))) {
+            return;
+        }
+        const u64 original = memory.Read64(x0 + 0x40);
+        data = fmt::format("dispatcher={:#x} original={:#x} working_50={}", x0, original,
+                           CameraWords<8>(memory, original + 0x50));
+        break;
+    }
+    }
+    LOG_INFO(Core_ARM,
+             "Dusk CPU camera capture_frame={} {} rva={:#x} return_rva={:#x} lr={:#x} tls={:#x} {}",
+             frame, site.name, rva, caller, lr, tls, data);
+}
+
+} // Anonymous namespace
 
 DynarmicCallbacks64::DynarmicCallbacks64(ArmDynarmic64& parent, Kernel::KProcess* process)
     : m_parent{parent}, m_memory(process->GetMemory())
@@ -63,6 +445,54 @@ std::optional<u32> DynarmicCallbacks64::MemoryReadCode(u64 vaddr) {
         last_code_addr = aligned_vaddr;
     }
     const u32 instruction = cached_code_page.inst[(vaddr & Core::Memory::YUZU_PAGEMASK) / sizeof(u32)];
+    namespace Wide = DuskUltrawide;
+    const u64 page_offset = vaddr & Memory::YUZU_PAGEMASK;
+    if ((page_offset == (Wide::OptionalReturn.rva & Memory::YUZU_PAGEMASK) ||
+         page_offset == (Wide::AfterOptional.rva & Memory::YUZU_PAGEMASK)) &&
+        DuskUltrawide::Enabled() &&
+        m_process->GetProgramId() == DuskCameraTrace::ProgramId) {
+        const auto wide = Wide::session.load();
+        const auto* site = wide && wide->owner == m_process ? Wide::FindHook(wide->base, vaddr) : nullptr;
+        if (site) {
+            if (wide->First(Wide::Event::Fetch)) {
+                LOG_INFO(Core_ARM, "Dusk ultrawide camera JIT fetched pc={:#x} opcode={:#010x}, expected={:#010x}",
+                         vaddr, instruction, site->word);
+            }
+            if (m_debugger_enabled) {
+                ReportDuskCameraRejection(*wide, Wide::Event::Debugger, "debugger enabled", 1, "==", 0);
+            } else if (instruction != site->word) {
+                ReportDuskCameraRejection(*wide, Wide::Event::FetchOpcode, "JIT instruction",
+                                          instruction, "==", site->word);
+            } else {
+                return DuskCameraTrace::BreakInstruction;
+            }
+        }
+    }
+    if (DuskRuntimeTrace::Enabled()) {
+        if (!m_dusk_runtime_trace_checked) {
+            const auto trace = DuskRuntimeTrace::session.load();
+            if (trace && trace->owner == m_process) {
+                m_dusk_runtime_trace = trace;
+            }
+            m_dusk_runtime_trace_checked = true;
+        }
+        if (m_dusk_runtime_trace && m_dusk_runtime_trace->FindSite(vaddr, instruction)) {
+            return DuskCameraTrace::BreakInstruction;
+        }
+    }
+    if (DuskCameraTrace::Enabled()) {
+        if (!m_dusk_camera_trace_checked) {
+            const auto trace = DuskCameraTrace::session.load();
+            if (trace && trace->owner == m_process) {
+                m_dusk_camera_trace = trace;
+            }
+            m_dusk_camera_trace_checked = true;
+        }
+        if (m_dusk_camera_trace &&
+            DuskCameraTrace::FindSite(m_dusk_camera_trace->base, vaddr, instruction)) {
+            return DuskCameraTrace::BreakInstruction;
+        }
+    }
     if (WindowTrace::Enabled() && m_process->GetProgramId() == WindowTrace::ProgramId) {
         if (!m_window_trace) {
             m_window_trace = WindowTrace::sessions.Find(m_process);
@@ -134,6 +564,105 @@ void DynarmicCallbacks64::InstructionCacheOperationRaised(Dynarmic::A64::Instruc
 }
 
 void DynarmicCallbacks64::ExceptionRaised(u64 pc, Dynarmic::A64::Exception exception) {
+    if (DuskUltrawide::Enabled() && !m_debugger_enabled &&
+        exception == Dynarmic::A64::Exception::Breakpoint) {
+        namespace Wide = DuskUltrawide;
+        const auto wide = Wide::session.load();
+        const auto* site = wide && wide->owner == m_process ? Wide::FindHook(wide->base, pc) : nullptr;
+        if (site) {
+            auto& jit = *m_parent.m_jit;
+            const auto reg = [&](std::size_t index) { return jit.GetRegister(index); };
+            const u32 instruction = m_memory.Read32(pc);
+            if (instruction != site->word) {
+                ReportDuskCameraRejection(*wide, Wide::Event::ExecuteOpcode, "executed instruction",
+                                          instruction, "==", site->word);
+                ReturnException(pc, PrefetchAbort);
+                return;
+            }
+            const bool early_return = site->rva == Wide::OptionalReturn.rva;
+            const u64 lr = reg(30);
+            if (early_return) {
+                jit.SetPC(lr);
+                if (lr != wide->base + Wide::AfterOptional.rva) {
+                    return;
+                }
+            }
+            if (wide->First(Wide::Event::Execute)) {
+                LOG_INFO(Core_ARM,
+                         "Dusk ultrawide camera hook executed pc={:#x} resume={:#x} lr={:#x} "
+                         "sp={:#x} fp={:#x} camera_arg={:#x} state={:#x} handoff={:#x} index={:#x} companion={:#x}",
+                         pc, jit.GetPC(), lr, jit.GetSP(), reg(29), reg(3), reg(19), reg(20),
+                         u32(reg(21)), reg(23));
+            }
+            const auto read = [&](u64 address, std::size_t size) -> u64 {
+                if (!m_memory.IsValidVirtualAddressRange(address, size)) {
+                    return Wide::Unmapped;
+                }
+                if (size == 8) {
+                    return m_memory.Read64(address);
+                }
+                return size == 4 ? m_memory.Read32(address) : m_memory.Read8(address);
+            };
+            const u64 state = reg(19);
+            const u64 optional_state = reg(25);
+            if (!early_return) {
+                // Dynarmic has advanced PC. Resume the original LDRB at the join.
+                jit.SetRegister(8, MemoryRead(optional_state + 0x2ed, 1));
+                if (!m_memory.IsValidVirtualAddressRange(optional_state + 0x2ed, 1)) {
+                    ReportDuskCameraRejection(*wide, Wide::Event::OriginalLoad, "mapped LDRB address",
+                                              Wide::Unmapped, "==", optional_state + 0x2ed);
+                    return;
+                }
+            }
+            const auto reject = [&](Wide::Event event, std::string_view field, u64 observed,
+                                    std::string_view comparison, u64 expected) {
+                ReportDuskCameraRejection(*wide, event, field, observed, comparison, expected);
+            };
+            const u64 camera = Wide::CameraToOverride(wide->base, *site, jit.GetSP(), reg(29), lr,
+                                                     reg(3), state, reg(20), u32(reg(21)), reg(23),
+                                                     optional_state, read, reject,
+                                                     wide->native_resolution);
+            if (camera) {
+                const u64 address = camera + Wide::AspectOffset;
+                m_memory.Write32(address, Wide::WideAspect);
+                if (!wide->Seen(Wide::Event::Applied)) {
+                    const u64 actual = read(address, 4);
+                    if (actual != Wide::WideAspect) {
+                        reject(Wide::Event::WriteReadback, "local aspect readback", actual,
+                               "==", Wide::WideAspect);
+                    } else if (wide->First(Wide::Event::Applied)) {
+                        LOG_INFO(Core_ARM,
+                                 "Dusk ultrawide camera applied 43:18 to worker-local copy: "
+                                 "camera={:#x} aspect_address={:#x} old={:#010x} readback={:#010x} "
+                                 "expected={:#010x}",
+                                 camera, address, Wide::StockAspect, actual, Wide::WideAspect);
+                    }
+                }
+            }
+            return;
+        }
+    }
+    if (m_dusk_runtime_trace && exception == Dynarmic::A64::Exception::Breakpoint) {
+        if (const auto* site = m_dusk_runtime_trace->FindSite(pc, m_memory.Read32(pc))) {
+            auto& jit = *m_parent.m_jit;
+            if (m_dusk_runtime_trace->Active()) {
+                ObserveDuskRuntime(*m_dusk_runtime_trace, site->rva, jit, m_memory, m_tpidrro_el0);
+            }
+            ResumeDuskRuntime(site->rva, pc, jit, m_memory);
+            return;
+        }
+    }
+    if (m_dusk_camera_trace && exception == Dynarmic::A64::Exception::Breakpoint) {
+        if (const auto* site =
+                DuskCameraTrace::FindSite(m_dusk_camera_trace->base, pc, m_memory.Read32(pc))) {
+            auto& jit = *m_parent.m_jit;
+            if (m_dusk_camera_trace->IsActive()) {
+                TraceDuskCamera(*m_dusk_camera_trace, *site, jit, m_memory, m_tpidrro_el0);
+            }
+            DuskCameraTrace::Resume(*site, jit, m_memory);
+            return;
+        }
+    }
     if (m_window_trace && exception == Dynarmic::A64::Exception::Breakpoint) {
         const auto point = WindowTrace::Identify(m_window_trace->base, pc, m_memory.Read32(pc));
         if (point != WindowTrace::Point::None) {

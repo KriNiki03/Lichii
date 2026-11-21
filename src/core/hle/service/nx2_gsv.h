@@ -2113,6 +2113,7 @@ private:
         u64 address{};
         u32 parent{};
         u64 parent_offset{};
+        bool image_fits_allocation{};
         std::optional<Nx2NativeObjects::VideoTrace> video_trace;
         Nx2ImageLayout layout{};
         Nx2NativeImageFormat image_format{};
@@ -2132,6 +2133,8 @@ private:
             parent = memory->second.parent;
             parent_offset = memory->second.parent_offset + image->second.offset;
             layout = Nx2CalculateImageLayout(image->second.preference.data());
+            image_fits_allocation = image->second.offset <= memory->second.size &&
+                                    layout.size <= memory->second.size - image->second.offset;
             image_format = static_cast<Nx2NativeImageFormat>(image->second.preference[6]);
             color_space = image->second.color_space;
             linear_unit_luminance = image->second.linear_unit_luminance;
@@ -2231,6 +2234,8 @@ private:
             .native_tiling = true,
             .color_space = color_space,
             .linear_unit_luminance = linear_unit_luminance,
+            .has_guest_crop = has_shown_size && image_fits_allocation &&
+                              crop_width == shown_width && crop_height == shown_height,
         }};
         std::vector<Nvidia::NvFence> fences;
         if (fence_id < 192) {

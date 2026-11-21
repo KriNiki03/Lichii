@@ -476,6 +476,48 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
                 }
                 offset += entry.size;
             }
+            if (Core::DuskRuntimeTrace::Enabled()) {
+                using namespace Core::DuskRuntimeTrace;
+                if (const auto trace = session.load();
+                    trace && trace->owner == system.ApplicationProcess() && trace->Active()) {
+                    std::scoped_lock lock{trace->mutex};
+                    if (trace->Active() && !trace->packets.empty()) {
+                        auto& memory = *channel_state->memory_manager;
+                        for (u32 i = 0; i < entries.command_lists.size(); ++i) {
+                            const auto& entry = entries.command_lists[i];
+                            if (std::ranges::binary_search(entries.deferred_entries, i)) {
+                                continue;
+                            }
+                            const u64 end = entry.addr + entry.size * sizeof(u32);
+                            for (auto it = trace->packets.lower_bound(entry.addr);
+                                 it != trace->packets.end() && it->first < end; ++it) {
+                                const auto& packet = it->second;
+                                const u64 word = (packet.gpu - entry.addr) / sizeof(u32);
+                                if (end - packet.gpu < sizeof(packet.words) ||
+                                    memory.GetPointer(packet.gpu) != packet.backing.front() ||
+                                    memory.GetPointer(packet.gpu + sizeof(packet.words) - 1) !=
+                                        packet.backing.back()) {
+                                    continue;
+                                }
+                                const auto* submitted = entries.submitted_words.data() +
+                                                        entries.submitted_offsets[i] + word;
+                                if (std::ranges::equal(packet.words, std::span{submitted, PacketWords},
+                                                       {}, std::identity{}, &Tegra::CommandHeader::argument)) {
+                                    if (trace->submitted_count < 2 * Session::MaxPackets) {
+                                        entries.dusk_packets.push_back({packet, i, static_cast<u32>(word)});
+                                        ++trace->submitted_count;
+                                    } else {
+                                        trace->overflow = true;
+                                    }
+                                }
+                            }
+                        }
+                        if (!entries.dusk_packets.empty()) {
+                            entries.dusk_submission = ++trace->submission;
+                        }
+                    }
+                }
+            }
         }
     }
 

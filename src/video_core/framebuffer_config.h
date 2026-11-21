@@ -47,6 +47,7 @@ struct FramebufferConfig {
     u32 layer_stack_mask{Service::Nvnflinger::DefaultLayerStackMask};
     ColorSpace color_space{ColorSpace::RGB709};
     u16 linear_unit_luminance{}; // Nits per linear 1.0; typically 80 for scRGB (observed in MKW's SDK).
+    bool has_guest_crop{}; // Explicit guest crop within the registered image and allocation.
 };
 
 Common::Rectangle<f32> NormalizeCrop(const FramebufferConfig& framebuffer, u32 texture_width,

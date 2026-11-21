@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include "core/arm/dynarmic/dusk_runtime_trace.h"
+
 #include <array>
 #include <chrono>
 #include <atomic>
@@ -131,6 +133,8 @@ struct CommandList final {
     /// that waited behind one, reads memory instead: games write the commands it runs before they
     /// release the acquire.
     u64 snapshot_suspensions = 0;
+    u64 dusk_submission{};
+    std::vector<Core::DuskRuntimeTrace::SubmittedPacket> dusk_packets;
 };
 
 /// FNV-1a over pushbuffer words (EDEN_NX2_PB_CHECK).
@@ -205,6 +209,8 @@ private:
 
     void CallMethod(u32 argument);
     void CallMultiMethod(const u32* base_start, u32 num_methods);
+    Core::DuskRuntimeTrace::Source DuskSource(u32 amount) const;
+    std::span<const CommandHeader> dusk_parsed_words;
     [[nodiscard]] bool WantsSegment() const;
     void ReportUnboundSubchannel();
     void WatchArgument(u32 method, u32 argument) const;

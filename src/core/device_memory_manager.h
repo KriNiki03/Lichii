@@ -12,6 +12,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <source_location>
 #include <vector>
 #include <span>
@@ -116,6 +117,20 @@ public:
             return 0;
         }
         return (PAddr(paddr - 1) << page_bits) + subbits;
+    }
+
+    /// Process mapping behind one mapped device byte. ASIDs here belong to the SMMU.
+    std::optional<std::pair<Asid, VAddr>> GetProcessBacking(DAddr address) {
+        if (address >= device_as_size) {
+            return std::nullopt;
+        }
+        std::scoped_lock lk(mapping_guard);
+        const size_t page = address >> page_bits;
+        if (tracked_entries[page].compressed_physical_ptr == 0) {
+            return std::nullopt;
+        }
+        auto [asid, base] = ExtractCPUBacking(page);
+        return std::pair{asid, base + (address & page_mask)};
     }
 
     template <typename T>

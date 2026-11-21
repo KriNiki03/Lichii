@@ -5,9 +5,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <memory>
+#include <cstdlib>
+#include <filesystem>
 
 #include "common/logging.h"
 #include "common/settings.h"
+#include "core/arm/dynarmic/dusk_camera_trace.h"
 #include "core/core.h"
 #include "core/frontend/emu_window.h"
 #include "core/frontend/graphics_context.h"
@@ -23,6 +26,16 @@
 
 namespace {
 
+std::filesystem::path DuskCameraTraceTrigger(const Core::System& system) {
+    const char* trigger = std::getenv("EDEN_DUSK_CAMERA_TRACE");
+    if (!trigger || !*trigger ||
+        system.GetApplicationProcessProgramID() != Core::DuskCameraTrace::ProgramId ||
+        system.GetApplicationProcessBuildID() != Core::DuskCameraTrace::BuildId) {
+        return {};
+    }
+    return trigger;
+}
+
 std::unique_ptr<VideoCore::RendererBase> CreateRenderer(Core::System& system, Core::Frontend::EmuWindow& emu_window, Tegra::GPU& gpu, std::unique_ptr<Core::Frontend::GraphicsContext> context) {
     [[maybe_unused]] auto& device_memory = system.Host1x().MemoryManager();
     switch (Settings::values.renderer_backend.GetValue()) {
@@ -33,7 +46,8 @@ std::unique_ptr<VideoCore::RendererBase> CreateRenderer(Core::System& system, Co
         return std::make_unique<OpenGL::RendererOpenGL>(emu_window, device_memory, gpu, std::move(context));
 #endif
     case Settings::RendererBackend::Vulkan:
-        return std::make_unique<Vulkan::RendererVulkan>(emu_window, device_memory, gpu, std::move(context));
+        return std::make_unique<Vulkan::RendererVulkan>(emu_window, device_memory, gpu,
+                                                        std::move(context), DuskCameraTraceTrigger(system));
     case Settings::RendererBackend::Null:
         return std::make_unique<Null::RendererNull>(emu_window, gpu, std::move(context));
     default:

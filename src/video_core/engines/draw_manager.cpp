@@ -242,10 +242,14 @@ void Maxwell3D::DrawManager::DrawBegin(Maxwell3D& maxwell3d) {
         draw_state.instance_count++;
         draw_state.draw_mode = DrawMode::Instance;
     }
+    if (reset_instance_count || increment_instance_count) {
+        draw_state.dusk_source = Core::DuskRuntimeTrace::current_source;
+    }
     draw_state.topology = maxwell3d.regs.draw.topology;
 }
 
 void Maxwell3D::DrawManager::DrawEnd(Maxwell3D& maxwell3d, u32 instance_count, bool force_draw) {
+    const Core::DuskRuntimeTrace::SourceScope source{draw_state.dusk_source};
     switch (draw_state.draw_mode) {
     case DrawMode::Instance:
         if (!force_draw) {

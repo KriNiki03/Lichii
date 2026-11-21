@@ -19,6 +19,10 @@
 #include "common/settings.h"
 #include "common/swap.h"
 #include "core/core.h"
+#include "core/arm/dynarmic/dusk_camera_trace.h"
+#include "core/arm/dynarmic/dusk_runtime_trace.h"
+#include "core/arm/dynarmic/dusk_ultrawide.h"
+#include "core/loader/dusk_native_resolution.h"
 #include "core/arm/dynarmic/window_trace.h"
 #include "core/file_sys/patch_manager.h"
 #include "core/hle/kernel/code_set.h"
@@ -326,7 +330,124 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
         }
     }
 
+    if (name == "main" && Core::DuskUltrawide::Enabled()) {
+        namespace Wide = Core::DuskUltrawide;
+        Wide::session.store(nullptr);
+        if (process.GetProgramId() == Core::DuskCameraTrace::ProgramId) {
+            const auto& text = nso_header.segments[0];
+            const bool eligible = patches == nullptr &&
+                (load_base & Core::Memory::YUZU_PAGEMASK) == 0 &&
+                nso_header.build_id == Core::DuskCameraTrace::BuildId;
+            const bool matching = eligible &&
+                std::ranges::all_of(Wide::Instructions, [&](const Wide::Instruction& site) {
+                    if (site.rva < text.location ||
+                        u64{site.rva} + sizeof(u32) > u64{text.location} + text.size) {
+                        LOG_INFO(Loader, "Dusk ultrawide camera rejected: RVA {:#x} outside text [{:#x}, {:#x})",
+                                 site.rva, text.location, u64{text.location} + text.size);
+                        return false;
+                    }
+                    u32 word{};
+                    std::memcpy(&word, codeset.memory.data() + module_start + site.rva,
+                                sizeof(word));
+                    if (word != site.word) {
+                        LOG_INFO(Loader, "Dusk ultrawide camera rejected: RVA {:#x} opcode={:#010x} expected={:#010x}",
+                                 site.rva, word, site.word);
+                    }
+                    return word == site.word;
+                });
+            if (!eligible) {
+                LOG_INFO(Loader,
+                         "Dusk ultrawide camera rejected: build={} expected={} NCE patches={} expected=false "
+                         "base_page_offset={:#x} expected=0",
+                         Common::HexToString(nso_header.build_id),
+                         Common::HexToString(Core::DuskCameraTrace::BuildId), patches != nullptr,
+                         load_base & Core::Memory::YUZU_PAGEMASK);
+            }
+            if (matching) {
+                bool native_resolution = false;
+                if (Wide::NativeResolutionRequested()) {
+                    if (Settings::values.use_gdbstub.GetValue() ||
+                        (pm && pm->HasNSOPatch(nso_header.build_id, name))) {
+                        LOG_WARNING(Loader, "Dusk native ultrawide requires the debugger and main "
+                                            "NSO patches to be disabled");
+                    } else if (const auto rejected = Wide::ApplyNativeResolutionPatch(
+                                   std::span{codeset.memory}.subspan(module_start + text.location,
+                                                                     text.size),
+                                   text.location)) {
+                        LOG_WARNING(Loader, "Dusk native ultrawide rejected at main+{:#x}", *rejected);
+                    } else {
+                        native_resolution = true;
+                    }
+                }
+                if (native_resolution || Wide::CameraRequested()) {
+                    Wide::session.store(
+                        std::make_shared<Wide::Session>(&process, load_base, native_resolution));
+                }
+                LOG_INFO(Loader, "Dusk ultrawide: native_path_active={}", native_resolution);
+            }
+            LOG_INFO(Loader, "Dusk ultrawide camera {} main={:#x} optional_ret={:#x}/{:#010x} "
+                             "worker_join={:#x}/{:#010x}",
+                     Wide::session.load() ? "registered" : "skipped", load_base,
+                     load_base + Wide::OptionalReturn.rva, Wide::OptionalReturn.word,
+                     load_base + Wide::AfterOptional.rva, Wide::AfterOptional.word);
+        }
+    }
+
     // Load codeset for current process
+    if (Core::DuskRuntimeTrace::Enabled() &&
+        process.GetProgramId() == Core::DuskCameraTrace::ProgramId) {
+        namespace Trace = Core::DuskRuntimeTrace;
+        const auto matches = [&](const auto& build, const auto& sites) {
+            const auto& text = nso_header.segments[0];
+            return patches == nullptr && nso_header.build_id == build &&
+                   std::ranges::all_of(sites, [&](const Trace::Site& site) {
+                       if (site.rva < text.location ||
+                           u64{site.rva} + sizeof(u32) > u64{text.location} + text.size) {
+                           return false;
+                       }
+                       u32 instruction{};
+                       std::memcpy(&instruction, codeset.memory.data() + module_start + site.rva,
+                                   sizeof(instruction));
+                       return instruction == site.instruction;
+                   });
+        };
+        if (name == "main") {
+            Trace::session.store(nullptr);
+            Trace::validated_main_base = load_base;
+            Trace::validated_main_owner =
+                matches(Core::DuskCameraTrace::BuildId, Trace::MainSites) ? &process : nullptr;
+        } else if (name == "sdk") {
+            const bool matching = Trace::validated_main_owner == &process &&
+                                  matches(Trace::SdkBuildId, Trace::SdkSites);
+            Trace::session.store(matching ? std::make_shared<Trace::Session>(
+                                               &process, Trace::validated_main_base, load_base)
+                                          : nullptr);
+            LOG_INFO(Loader, "Dusk runtime trace {} main={:#x} sdk={:#x}",
+                     matching ? "registered" : "skipped (backend, build or instructions differ)",
+                     Trace::validated_main_base, load_base);
+        }
+    }
+    if (name == "main" && process.GetProgramId() == Core::DuskCameraTrace::ProgramId &&
+        Core::DuskCameraTrace::Enabled()) {
+        using namespace Core::DuskCameraTrace;
+        const auto& text = nso_header.segments[0];
+        const bool matching = patches == nullptr && nso_header.build_id == BuildId &&
+            std::ranges::all_of(Sites, [&](const Site& site) {
+                if (site.rva < text.location ||
+                    static_cast<u64>(site.rva) + sizeof(u32) >
+                        static_cast<u64>(text.location) + text.size) {
+                    return false;
+                }
+                u32 instruction{};
+                std::memcpy(&instruction, codeset.memory.data() + module_start + site.rva,
+                            sizeof(instruction));
+                return instruction == site.instruction;
+            });
+        session.store(matching ? std::make_shared<Session>(process, load_base) : nullptr);
+        LOG_INFO(Loader, "Dusk CPU camera trace {} at main base={:#x}",
+                 matching ? "registered" : "skipped (backend, build or instructions differ)",
+                 load_base);
+    }
     if (name == "sdk") {
         const bool matching_sdk =
             Core::WindowTrace::Enabled() && process.GetProgramId() == Core::WindowTrace::ProgramId &&

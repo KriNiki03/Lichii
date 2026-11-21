@@ -52,6 +52,23 @@ constexpr bool ValidRegions(const TemporalRegions& regions,
            FitsExtent(regions.output, output_backing);
 }
 
+constexpr std::array<std::uint32_t, 2> DuskWideOutput{3440, 1440};
+
+constexpr bool ValidDuskWideRegions(const TemporalRegions& regions,
+                                    std::array<std::uint32_t, 2> input_backing,
+                                    std::array<std::uint32_t, 2> output_backing) {
+    if (regions.output != DuskWideOutput ||
+        !ValidRegions(regions, input_backing, output_backing)) {
+        return false;
+    }
+    // Independent rounding to a four-pixel grid can move either axis by two pixels.
+    const auto [width, height] = regions.render;
+    const auto [output_width, output_height] = DuskWideOutput;
+    const auto error = std::int64_t{width} * output_height - std::int64_t{height} * output_width;
+    const auto tolerance = 2 * std::int64_t{output_width + output_height};
+    return error >= -tolerance && error <= tolerance;
+}
+
 constexpr bool ValidDepthFormat(VideoCore::Surface::PixelFormat format, bool subrect) {
     using VideoCore::Surface::PixelFormat;
     return format == PixelFormat::D32_FLOAT ||

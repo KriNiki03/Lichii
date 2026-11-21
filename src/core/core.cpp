@@ -18,6 +18,7 @@
 #include "common/settings.h"
 #include "common/settings_enums.h"
 #include "common/string_util.h"
+#include "core/arm/dynarmic/dusk_ultrawide.h"
 #include "core/arm/exclusive_monitor.h"
 #include "core/core.h"
 
@@ -441,6 +442,7 @@ struct System::Impl {
         const auto file = GetGameFileFromPath(virtual_filesystem, filepath);
 
         // Create the application process
+        build_id = {};
         Loader::ResultStatus load_result{};
         std::vector<u8> control;
         auto process = Service::AM::CreateApplicationProcess(control, app_loader, load_result, system, file, params.program_id, params.program_index);
@@ -549,6 +551,13 @@ struct System::Impl {
         kernel.SuspendEmulation(true);
         kernel.CloseServices();
         kernel.ShutdownCores();
+        if (const auto wide = DuskUltrawide::session.load();
+            wide && wide->owner == kernel.ApplicationProcess()) {
+            using DuskUltrawide::Event;
+            LOG_INFO(Core_ARM, "Dusk ultrawide camera session: jit_fetched={} hook_executed={} applied={}",
+                     wide->Seen(Event::Fetch), wide->Seen(Event::Execute), wide->Seen(Event::Applied));
+            DuskUltrawide::session.store(nullptr);
+        }
         services.reset();
         service_manager.reset();
         fs_controller.Reset();

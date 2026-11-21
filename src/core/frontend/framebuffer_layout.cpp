@@ -25,11 +25,18 @@ static Common::Rectangle<u32> MaxRectangle(Common::Rectangle<u32> window_area, f
 /// @return Newly created FramebufferLayout object with default screen regions initialized
 FramebufferLayout DefaultFrameLayout(u32 width, u32 height) noexcept {
     ASSERT(width > 0 && height > 0);
+    const float window_aspect_ratio = float(height) / float(width);
+    const float aspect = EmulationAspectRatio(Settings::values.aspect_ratio.GetValue(),
+                                             window_aspect_ratio);
+    return FrameLayoutWithAspect(width, height, aspect);
+}
+
+FramebufferLayout FrameLayoutWithAspect(u32 width, u32 height, float height_over_width) noexcept {
+    ASSERT(width > 0 && height > 0);
     auto const window_aspect_ratio = float(height) / float(width);
-    auto const emulation_aspect_ratio = EmulationAspectRatio(Settings::values.aspect_ratio.GetValue(), window_aspect_ratio);
     Common::Rectangle<u32> const screen_window_area{0, 0, width, height};
-    auto screen = MaxRectangle(screen_window_area, emulation_aspect_ratio);
-    if (window_aspect_ratio < emulation_aspect_ratio) {
+    auto screen = MaxRectangle(screen_window_area, height_over_width);
+    if (window_aspect_ratio < height_over_width) {
         screen = screen.TranslateX((screen_window_area.GetWidth() - screen.GetWidth()) / 2);
     } else {
         screen = screen.TranslateY((height - screen.GetHeight()) / 2);

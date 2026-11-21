@@ -44,7 +44,8 @@ class RendererVulkan final : public VideoCore::RendererBase {
 public:
     explicit RendererVulkan(Core::Frontend::EmuWindow& emu_window,
                             Tegra::MaxwellDeviceMemoryManager& device_memory_, Tegra::GPU& gpu_,
-                            std::unique_ptr<Core::Frontend::GraphicsContext> context_);
+                            std::unique_ptr<Core::Frontend::GraphicsContext> context_,
+                            std::filesystem::path dusk_camera_trigger);
     ~RendererVulkan() override;
 
     void Composite(std::span<const Tegra::FramebufferConfig> framebuffers) override;

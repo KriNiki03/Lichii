@@ -26,6 +26,14 @@ namespace Core::WindowTrace {
 class Session;
 }
 
+namespace Core::DuskCameraTrace {
+class Session;
+}
+
+namespace Core::DuskRuntimeTrace {
+struct Session;
+}
+
 namespace Kernel {
 enum class DebugWatchpointType : u8;
 class KPRocess;
@@ -73,6 +81,10 @@ public:
     u64 m_spin_ticks{32}; ///< Reads closer than this (~1.7 us) count as a polling loop
     Kernel::KProcess* m_process{};
     std::shared_ptr<WindowTrace::Session> m_window_trace;
+    std::shared_ptr<DuskCameraTrace::Session> m_dusk_camera_trace;
+    bool m_dusk_camera_trace_checked{};
+    std::shared_ptr<DuskRuntimeTrace::Session> m_dusk_runtime_trace;
+    bool m_dusk_runtime_trace_checked{};
     const bool m_debugger_enabled{};
     const bool m_check_memory_access{};
     static constexpr u64 MinimumRunCycles = 10000U;

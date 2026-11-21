@@ -6,12 +6,14 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <condition_variable>
 #include <memory>
 #include <limits>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <tuple>
 #include <set>
@@ -23,6 +25,9 @@
 
 #include <fmt/format.h>
 
+#include "core/arm/dynarmic/dusk_camera_trace.h"
+#include "core/arm/dynarmic/dusk_runtime_trace.h"
+#include "core/arm/dynarmic/dusk_ultrawide.h"
 #include "video_core/renderer_vulkan/renderer_vulkan.h"
 
 #include "common/assert.h"
@@ -40,6 +45,7 @@
 #include "video_core/indirect_reset.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/kepler_compute.h"
+#include "video_core/framebuffer_config.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/renderer_vulkan/blit_image.h"
@@ -257,7 +263,8 @@ bool IsPrimitiveRestartSupported(const Device& device, VkPrimitiveTopology topol
 RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra::GPU& gpu_,
                                    Tegra::MaxwellDeviceMemoryManager& device_memory_,
                                    const Device& device_, MemoryAllocator& memory_allocator_,
-                                   StateTracker& state_tracker_, Scheduler& scheduler_)
+                                   StateTracker& state_tracker_, Scheduler& scheduler_,
+                                   std::filesystem::path dusk_camera_trigger_)
     : gpu{gpu_}, device_memory{device_memory_}, device{device_},
       memory_allocator{memory_allocator_}, state_tracker{state_tracker_}, scheduler{scheduler_},
       staging_pool(device, memory_allocator, scheduler), descriptor_pool(device, scheduler),
@@ -281,7 +288,11 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
                      gpu.ShaderNotify()),
       accelerate_dma(buffer_cache, texture_cache, scheduler),
       fence_manager(*this, gpu, texture_cache, buffer_cache, query_cache, device, scheduler),
-      frame_dump(device, memory_allocator, scheduler) {
+      frame_dump(device, memory_allocator, scheduler),
+      dusk_camera_trigger(std::move(dusk_camera_trigger_)) {
+    if (!dusk_camera_trigger.empty()) {
+        LOG_INFO(Render_Vulkan, "Dusk camera trace enabled for the matching main NSO build");
+    }
     scheduler.SetQueryCache(query_cache);
     buffer_cache.SetPendingCpuWrites(
         [this](const std::function<void(DAddr, size_t)>& callback) {
@@ -541,6 +552,59 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         draw_func();
     }
     submitted = true;
+    const u64 vertex_hash = pipeline->ShaderHashes()[1];
+    const bool dusk_world = vertex_hash == 0xaf80c123fbd8d4efULL;
+    if (dusk_world && Core::DuskUltrawide::Enabled()) {
+        using namespace Core::DuskUltrawide;
+        if (const auto wide = session.load(); wide && wide->Seen(Event::Applied) &&
+            wide->First(Event::WorldGeometry)) {
+            const auto& regs = maxwell3d->regs;
+            const auto& view = regs.viewport_transform[0];
+            const auto& scissor = regs.scissor_test[0];
+            LOG_INFO(Render_Vulkan,
+                     "Dusk ultrawide world sample: frame={} worker_aspect=43:18 "
+                     "viewport=({},{},{}x{}) scissor_enabled={} scissor=({},{})..({},{}) "
+                     "surface_clip=({},{},{}x{}) color0={}x{} depth={}x{}",
+                     render_trace_frame, view.translate_x - view.scale_x,
+                     view.translate_y - view.scale_y, 2 * view.scale_x, 2 * view.scale_y,
+                     scissor.enable, scissor.min_x.Value(), scissor.min_y.Value(),
+                     scissor.max_x.Value(), scissor.max_y.Value(), regs.surface_clip.x.Value(),
+                     regs.surface_clip.y.Value(), regs.surface_clip.width.Value(),
+                     regs.surface_clip.height.Value(), regs.rt[0].width, regs.rt[0].height,
+                     regs.zeta_size.width, regs.zeta_size.height);
+        }
+    }
+    if (Core::DuskRuntimeTrace::Enabled() &&
+        (dusk_world || Core::DuskRuntimeTrace::current_source.event)) {
+        using namespace Core::DuskRuntimeTrace;
+        if (const auto trace = session.load(); trace && trace->ObservingGpu()) {
+            std::scoped_lock trace_lock{trace->mutex};
+            const auto& source = current_source;
+            const bool selected = dusk_world && trace->last_world_frame != render_trace_frame;
+            auto& tagged_frame = dusk_world ? trace->last_tagged_world_frame : trace->last_tagged_frame;
+            const bool first_tagged = source.event && tagged_frame != render_trace_frame;
+            if ((selected || first_tagged) && trace->draw_count < 384) {
+                ++trace->draw_count;
+                if (dusk_world) {
+                    trace->last_world_frame = render_trace_frame;
+                }
+                if (source.event) {
+                    tagged_frame = render_trace_frame;
+                }
+                LOG_INFO(Render_Vulkan,
+                         "Dusk runtime seq={} draw shader={:016x} frame={} selected={} "
+                         "indexed={} indirect={} event={} worker={} list={:#x} submission={} "
+                         "space={} channel={} entry={} macro={:#x} nvn_buffer={:#x}",
+                         ++trace->sequence, vertex_hash, render_trace_frame, selected, is_indexed, is_indirect,
+                         source.event, source.worker, source.header, source.submission,
+                         source.space, source.channel, source.entry, source.gpu, source.buffer);
+            }
+        }
+    }
+    if (dusk_camera_armed && pipeline->ShaderHashes()[1] == 0xaf80c123fbd8d4efULL) {
+        dusk_camera_armed = false;
+        TraceDuskCamera();
+    }
     static u32 native_capture_count{};
     if (maxwell3d->GetNativeMacroEngine().native_turing &&
         native_capture_count < 16 && [] {
@@ -2069,6 +2133,96 @@ void RasterizerVulkan::TracePendingCpuWrites(bool compute, std::span<const u64> 
     });
 }
 
+void RasterizerVulkan::TraceDuskCamera() {
+    const auto& regs = maxwell3d->regs;
+    const auto& viewport = regs.viewport_transform[0];
+    const auto& scissor = regs.scissor_test[0];
+    LOG_INFO(Render_Vulkan,
+             "Dusk camera draw frame={} space={} vs=af80c123fbd8d4ef "
+             "viewport_scale=({},{},{}) translate=({},{},{}) scissor={} [{},{})x[{},{}) "
+             "surface_clip=({},{},{}x{}) rt0={:#x} {}x{} depth={:#x} {}x{}",
+             render_trace_frame, gpu_memory->GetID(), viewport.scale_x, viewport.scale_y,
+             viewport.scale_z, viewport.translate_x, viewport.translate_y, viewport.translate_z,
+             scissor.enable, scissor.min_x.Value(), scissor.max_x.Value(), scissor.min_y.Value(),
+             scissor.max_y.Value(), regs.surface_clip.x.Value(), regs.surface_clip.y.Value(),
+             regs.surface_clip.width.Value(), regs.surface_clip.height.Value(), regs.rt[0].Address(),
+             regs.rt[0].width, regs.rt[0].height, regs.zeta.Address(), regs.zeta_size.width,
+             regs.zeta_size.height);
+
+    constexpr u32 pointer_offset = 0x20;
+    constexpr u32 rows_offset = 0x180;
+    using Rows = std::array<u32, 16>;
+    const auto& cbuf = maxwell3d->state.shader_stages[0].const_buffers[4];
+    const GPUVAddr pointer_address = cbuf.address + pointer_offset;
+    if (!cbuf.enabled || cbuf.size < pointer_offset + sizeof(u64) ||
+        !gpu_memory->IsFullyMappedRange(pointer_address, sizeof(u64))) {
+        LOG_INFO(Render_Vulkan, "Dusk camera draw has no mapped vertex c4 pointer");
+        return;
+    }
+    GPUVAddr block{};
+    gpu_memory->ReadBlockUnsafe(pointer_address, &block, sizeof(block));
+    const GPUVAddr rows = block + rows_offset;
+    LOG_INFO(Render_Vulkan, "Dusk camera vertex c4={:#x} block={:#x} rows_gpu={:#x}", cbuf.address,
+             block, rows);
+    if (block > std::numeric_limits<GPUVAddr>::max() - rows_offset - sizeof(Rows) ||
+        !gpu_memory->IsFullyMappedRange(rows, sizeof(Rows))) {
+        LOG_INFO(Render_Vulkan, "Dusk camera rows are unmapped");
+        return;
+    }
+    const auto device_addr = gpu_memory->GpuToCpuAddress(rows);
+    const auto device_end = gpu_memory->GpuToCpuAddress(rows + sizeof(Rows) - 1);
+    if (device_addr && device_end == *device_addr + sizeof(Rows) - 1) {
+        const auto first = device_memory.GetProcessBacking(*device_addr);
+        const auto last = device_memory.GetProcessBacking(*device_end);
+        LOG_INFO(Render_Vulkan, "Dusk camera rows_device={:#x} gpu_dirty={} pending_cpu_write={}",
+                 *device_addr, buffer_cache.IsRegionGpuModified(*device_addr, sizeof(Rows)),
+                 gpu.HasPendingCPUWrites(*device_addr, sizeof(Rows)));
+        if (first && last && first->first.id == last->first.id &&
+            last->second == first->second + sizeof(Rows) - 1) {
+            LOG_INFO(Render_Vulkan, "Dusk camera backing smmu_asid={} rows_guest={:#x}",
+                     first->first.id, first->second);
+        } else {
+            LOG_INFO(Render_Vulkan, "Dusk camera rows have no contiguous process backing");
+        }
+    }
+    Rows guest_rows{};
+    gpu_memory->ReadBlockUnsafe(rows, guest_rows.data(), sizeof(guest_rows));
+    LOG_INFO(Render_Vulkan, "Dusk camera guest rows={:08x}", fmt::join(guest_rows, " "));
+
+    VkBuffer source{};
+    u32 source_offset{};
+    buffer_cache.ForEachBoundBuffer(false, [&](u32 stage, bool storage, u32 index, bool,
+                                              const auto& binding, u32 size, const auto* host,
+                                              u32 host_offset) {
+        if (stage == 0 && storage && host && binding.gpu_addr == block &&
+            size >= rows_offset + sizeof(Rows)) {
+            source = host->Handle();
+            source_offset = host_offset + rows_offset;
+            LOG_INFO(Render_Vulkan, "Dusk camera storage binding={} bound_bytes={:#x} "
+                     "device_base={:#x} host_rows_offset={:#x}",
+                     index, size, binding.device_addr, source_offset);
+        }
+    });
+    if (!source || source_offset % sizeof(u32) != 0) {
+        LOG_INFO(Render_Vulkan, "Dusk camera rows unavailable from a bound Vulkan buffer");
+        return;
+    }
+    auto readback = memory_allocator.CreateBuffer(
+        VkBufferCreateInfo{.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                           .size = sizeof(Rows),
+                           .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                           .sharingMode = VK_SHARING_MODE_EXCLUSIVE},
+        MemoryUsage::Download);
+    const std::array copies{VideoCommon::BufferCopy{source_offset, 0, sizeof(Rows)}};
+    buffer_cache_runtime.CopyBuffer(*readback, source, copies, true);
+    scheduler.Finish();
+    readback.Invalidate();
+    Rows host_rows{};
+    std::memcpy(host_rows.data(), readback.Mapped().data(), sizeof(host_rows));
+    LOG_INFO(Render_Vulkan, "Dusk camera Vulkan rows={:08x} floats={:.9g}",
+             fmt::join(host_rows, " "), fmt::join(std::bit_cast<std::array<float, 16>>(host_rows), " "));
+}
+
 bool RasterizerVulkan::FrameDumpBuffers(bool compute, std::span<const u64> shader_hashes) {
     static constexpr u32 BUFFER_CAP = 4U << 20;
     std::vector<FrameDump::BoundBuffer> buffers;
@@ -2141,6 +2295,40 @@ void RasterizerVulkan::TickFrame() {
     }
     frame_dump.TickFrame();
     ++render_trace_frame;
+    if (!dusk_camera_trigger.empty()) {
+        if (dusk_camera_armed) {
+            LOG_INFO(Render_Vulkan, "Dusk camera shader absent in frame={}", render_trace_frame - 1);
+        }
+        std::error_code error;
+        const bool marker_present = std::filesystem::is_regular_file(dusk_camera_trigger, error);
+        dusk_camera_armed = marker_present && !dusk_camera_marker_present;
+        if (Core::DuskRuntimeTrace::Enabled()) {
+            if (const auto trace = Core::DuskRuntimeTrace::session.load()) {
+                if (dusk_camera_armed) {
+                    trace->Arm();
+                    LOG_INFO(Render_Vulkan, "Dusk runtime trace armed");
+                }
+                if (!trace->ObservingGpu() && trace->summary_pending) {
+                    std::scoped_lock trace_lock{trace->mutex};
+                    trace->summary_pending = false;
+                    LOG_INFO(Render_Vulkan,
+                             "Dusk runtime finished workers={} emitted={} submitted={} draw_logs={} capped={}",
+                             trace->admitted_workers, trace->emitted_count, trace->submitted_count,
+                             trace->draw_count, trace->overflow || trace->draw_count == 384);
+                }
+            }
+            dusk_camera_marker_present = marker_present;
+            dusk_camera_armed = false;
+        } else if (const auto trace = Core::DuskCameraTrace::session.load()) {
+            dusk_camera_armed = trace->Tick(render_trace_frame, dusk_camera_armed);
+        }
+        dusk_reconstruction_armed = dusk_camera_armed;
+        dusk_present_armed = dusk_camera_armed;
+        dusk_camera_marker_present = marker_present;
+        if (dusk_camera_armed) {
+            LOG_INFO(Render_Vulkan, "Dusk camera trace armed frame={}", render_trace_frame);
+        }
+    }
     render_trace_draws = 0;
     render_trace_clears = 0;
     if (Common::DkbFrameTrace::Enabled()) {
@@ -2212,6 +2400,19 @@ void RasterizerVulkan::TickFrame() {
     }
 }
 
+void RasterizerVulkan::TraceDuskPresent(const Tegra::FramebufferConfig& framebuffer) {
+    if (!dusk_present_armed) {
+        return;
+    }
+    dusk_present_armed = false;
+    const auto& crop = framebuffer.crop_rect;
+    LOG_INFO(Render_Vulkan,
+             "Dusk camera present frame={} device={:#x} backing={}x{} stride={} "
+             "crop=({},{})..({},{})",
+             render_trace_frame, framebuffer.address, framebuffer.width, framebuffer.height,
+             framebuffer.stride, crop.left, crop.top, crop.right, crop.bottom);
+}
+
 bool RasterizerVulkan::AccelerateConditionalRendering() {
     gpu_memory->FlushCaching();
     return query_cache.AccelerateHostConditionalRendering();
@@ -2248,6 +2449,15 @@ bool RasterizerVulkan::AccelerateTemporalUpscale(
     const Tegra::Engines::Fermi2D::Surface& motion_vectors, const Tegra::Texture::TICEntry* depth,
     std::array<f32, 2> jitter, std::array<f32, 2> motion_scale, bool use_history,
     std::optional<VideoCommon::DlssContract::TemporalRegions> regions, const char** failure) {
+    if (dusk_reconstruction_armed && regions) {
+        dusk_reconstruction_armed = false;
+        LOG_INFO(Render_Vulkan,
+                 "Dusk camera reconstruction frame={} input={}x{} of {}x{} at {:#x} "
+                 "output={}x{} of {}x{} at {:#x} jitter=({},{}) motion=({},{}) reset={}",
+                 render_trace_frame, regions->render[0], regions->render[1], src.width, src.height,
+                 src.Address(), regions->output[0], regions->output[1], dst.width, dst.height,
+                 dst.Address(), jitter[0], jitter[1], motion_scale[0], motion_scale[1], regions->reset);
+    }
     std::scoped_lock lock{texture_cache.mutex};
     try {
         return texture_cache.TemporalUpscale(dst, src, motion_vectors, depth, jitter, motion_scale,
